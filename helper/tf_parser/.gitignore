@@ -1,0 +1,15 @@
+/target
+**/*.rs.bk
+*.dem
+!/test_data/*.dem
+*.svg
+*.data*
+*.iml
+*.bench
+*.out
+heaptrack.*
+dhat.out.*
+result
+.direnv
+strings.txt
+models.txt

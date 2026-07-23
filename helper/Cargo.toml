@@ -1,0 +1,12 @@
+[package]
+name = "voice_extract"
+version = "0.2.0"
+edition = "2021"
+
+[dependencies]
+tf-demo-parser = { path = "tf_parser" }
+main_error = "0.1"
+
+[[bin]]
+name = "voice_extract"
+path = "src/main.rs"
