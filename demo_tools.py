@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import binascii
+from concurrent.futures import ThreadPoolExecutor
 import json
 import math
 import os
@@ -420,11 +421,15 @@ def join_pov_fragments(paths, target: Path):
 def write_pov_edit(info, ranges, target: Path, free_camera=False):
     if len(ranges) > 1:
         with temporary_directory("pov_montage_") as workspace:
-            fragments = []
-            for index, current in enumerate(ranges):
-                fragment = Path(workspace) / f"{index}.dem"
-                write_pov_edit(info, [current], fragment, free_camera)
-                fragments.append(fragment)
+            fragments = [Path(workspace) / f"{index}.dem" for index in range(len(ranges))]
+            # ponytail: two helpers avoid rereading a large POV demo serially; raise only if memory allows.
+            with ThreadPoolExecutor(max_workers=min(2, len(ranges))) as pool:
+                jobs = [
+                    pool.submit(write_pov_edit, info, [current], fragment, free_camera)
+                    for current, fragment in zip(ranges, fragments)
+                ]
+                for job in jobs:
+                    job.result()
             return join_pov_fragments(fragments, target)
     start, end = ranges[0]
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -771,9 +776,12 @@ $('#outputTrack').addEventListener('pointerup',clearOutputDropTargets);$('#outpu
 $('#outputTrack').addEventListener('dragover',event=>{if(dragIndex<0)return;clearOutputDropTargets();const target=event.target.closest('.output-clip');if(target&&+target.dataset.index!==dragIndex)target.classList.add('drop-target')});
 $('#outputTrack').addEventListener('dragend',clearOutputDropTargets);
 document.head.insertAdjacentHTML('beforeend',`<style>.player-tabs button[value=all]{order:-1}.player .name a,.event-player{color:inherit;text-decoration:none}.player .name a:hover,.event-player:hover{text-decoration:underline}.team-red{color:#df726a!important}.team-blu{color:#6d9bd0!important}.team-spectator{color:var(--muted)!important}.chat-row{cursor:pointer}.chat-row:hover{background:var(--panel)}.track.event-focus{outline:2px solid var(--accent);outline-offset:2px}.event-tip{background:var(--panel)!important;opacity:1}#languageOptions{left:0;right:auto}.flag{border:1px solid #0003!important;box-shadow:none!important}.flag::after{content:none!important}.flag-ru{background:linear-gradient(#fff 0 33.333%,#1d57a6 33.333% 66.666%)!important}.flag-en{background:#012169 url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 60 30'%3E%3Cpath fill='%23012169' d='M0 0h60v30H0z'/%3E%3Cpath stroke='%23fff' stroke-width='6' d='m0 0 60 30m0-30L0 30'/%3E%3Cpath stroke='%23c8102e' stroke-width='2' d='m0 0 60 30m0-30L0 30'/%3E%3Cpath stroke='%23fff' stroke-width='10' d='M30 0v30M0 15h60'/%3E%3Cpath stroke='%23c8102e' stroke-width='6' d='M30 0v30M0 15h60'/%3E%3C/svg%3E") center/cover no-repeat!important}</style>`);
-document.head.insertAdjacentHTML('beforeend',`<style>#track.tip-open{z-index:8;overflow:visible}.event-tip{z-index:9999!important}.selection{z-index:1!important;left:0!important;right:0!important;border:0!important;box-shadow:none!important;background:linear-gradient(to right,#0005 0 var(--start),transparent var(--start) var(--end),#0005 var(--end) 100%)!important}#chatRows .chat-row[hidden]{display:none!important}.montage-inline .actions{display:flex;gap:8px;align-items:center}.montage-name{flex:1;min-width:180px}.event-legend button{display:inline-flex;align-items:center;gap:6px;padding:3px 6px;border:1px solid transparent;border-radius:5px;background:transparent;color:inherit;font:inherit;cursor:pointer}.event-legend button[aria-pressed=false]{opacity:.38;text-decoration:line-through}.flag-ru{background:linear-gradient(to bottom,#fff 0 33.333%,#0039a6 33.333% 66.666%,#d52b1e 66.666% 100%)!important}.pov-free-camera{cursor:pointer;font:inherit}.pov-free-camera[aria-pressed=true]{background:var(--accent);border-color:var(--accent);color:#fff}</style>`);
+document.head.insertAdjacentHTML('beforeend',`<style>#track.tip-open{z-index:8;overflow:visible}.event-tip{z-index:9999!important}.selection{z-index:1!important;left:0!important;right:0!important;border:0!important;box-shadow:none!important;background:linear-gradient(to right,#0005 0 var(--start),transparent var(--start) var(--end),#0005 var(--end) 100%)!important}#chatRows .chat-row[hidden]{display:none!important}.montage-inline .actions{display:flex;gap:8px;align-items:center}.montage-name{flex:1;min-width:180px}.event-legend button{display:inline-flex;align-items:center;gap:6px;padding:3px 6px;border:1px solid transparent;border-radius:5px;background:transparent;color:inherit;cursor:pointer}.event-legend button[aria-pressed=false]{opacity:.38;text-decoration:line-through}.flag-ru{background:linear-gradient(to bottom,#fff 0 33.333%,#0039a6 33.333% 66.666%,#d52b1e 66.666% 100%)!important}.pov-free-camera{cursor:pointer;font:inherit}.pov-free-camera[aria-pressed=true]{background:var(--accent);border-color:var(--accent);color:#fff}#povControls,#povFreeCameraButton{display:none!important}.montage-free-camera{display:flex;align-items:center;margin:12px 0 0}.montage-free-camera .switch{margin:0}.montage-free-camera[hidden]{display:none}</style>`);
+document.head.insertAdjacentHTML('beforeend',`<style>
+#languageButton{width:44px;height:44px;justify-content:center;padding:0}#languageButton #languageLabel,#languageButton svg{display:none}.output-timeline{padding:48px 0 29px;margin-bottom:19px}.output-axis{z-index:4}.output-axis.top{top:3px}.output-axis .axis-hidden{display:none}.output-track{position:relative;z-index:1;height:68px;min-height:68px;overflow:visible}.output-clip{position:relative;min-width:0;height:68px;padding:0;overflow:visible;background:var(--clip);border-right:1px solid #0004}.output-clip canvas{display:block;width:100%;height:68px}.output-order,.output-range{position:absolute;left:7px;right:7px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:10.5px ui-monospace,Consolas,monospace;text-shadow:0 1px 1px #0008}.output-order{top:-15px;color:var(--ink)}.output-range{bottom:-19px;color:var(--muted)}.output-clip:first-child{border-radius:7px 0 0 7px}.output-clip:last-child{border-radius:0 7px 7px 0;border-right:0}.output-clip:only-child{border-radius:7px}.hero{max-width:620px;padding:22px 0 14px}.hero .eyebrow{display:none}.hero h1{margin:0 0 7px;font-size:clamp(26px,4vw,36px);letter-spacing:-.025em;line-height:1.12}.hero p{margin:0;font-size:14px;max-width:500px}.drop{margin-top:16px;padding:34px 24px}
+</style>`);
 const montageName=document.createElement('input');montageName.id='montageName';montageName.className='control montage-name';montageName.type='text';montageName.maxLength=100;montageName.spellcheck=false;montageName.setAttribute('aria-label','Demo filename');$('#downloadMontage').before(montageName);
-I18N.ru.eventsHistory='События · {count}';I18N.en.eventsHistory='Events · {count}';
+I18N.ru.eventsHistory='События · {count}';I18N.en.eventsHistory='Events · {count}';I18N.ru.heroTitle='Редактор TF2-демок';I18N.en.heroTitle='TF2 demo editor';I18N.ru.heroText='Нарезка, порядок отрезков, POV / SourceTV и голоса — локально.';I18N.en.heroText='Cut, arrange and export POV / SourceTV demos locally.';if(!state.meta){$('#heroTitle').innerHTML=tr('heroTitle');$('#intro [data-t="heroText"]').textContent=tr('heroText')}const applyLanguageWithIconTitle=applyLanguage;applyLanguage=value=>{applyLanguageWithIconTitle(value);$('#languageButton').title=tr('languageLabel');$('#languageButton').ariaLabel=tr('languageLabel')};$('#languageButton').title=tr('languageLabel');$('#languageButton').ariaLabel=tr('languageLabel');
 const steamProfile=name=>{const player=[...state.allPlayers,...state.players].find(player=>player.name===name),match=player?.steamid?.match(/U:1:(\\d+)/);return match?'https://steamcommunity.com/profiles/'+(76561197960265728n+BigInt(match[1])).toString():''};
 const playerLink=(name,team='')=>{const href=steamProfile(name),className=/spectator/i.test(team)?' team-spectator':/\\bRED\\b/i.test(team)?' team-red':/\\bBLU\\b/i.test(team)?' team-blu':'';return href?`<a class="event-player${className}" href="${href}" target="_blank" rel="noopener">${esc(name)}</a>`:`<span class="event-player${className}">${esc(name)}</span>`};
 const chatLine=event=>{const actor=String(event.actor||'').replace(/^:\\s*/,''),message=String(event.detail||'').replace(/^:\\s*/,''),head=actor?playerLink(actor,event.team||event.detail)+': ':'';return head+esc(message)};
@@ -798,12 +806,23 @@ const renderPovFreeCameraButton=()=>{const current=$('#povFreeCameraButton'),pov
 render=()=>{renderWithPovFreeCameraButton();renderPovFreeCameraButton()};
 $('#freeCamera').addEventListener('change',renderPovFreeCameraButton);
 $('#freeCamera').addEventListener('change',()=>{if(state.meta)montageName.value=state.meta.name.replace(/\\.dem$/i,'')+($('#freeCamera').checked?'-freecam':'-edit')});
+const legacyPovControls=$('#povControls'),montageFreeCamera=document.createElement('div');montageFreeCamera.id='montageFreeCamera';montageFreeCamera.className='montage-free-camera';$('.montage-inline .actions').before(montageFreeCamera);const freeCameraControl=$('#freeCamera').closest('label');freeCameraControl.title=tr('freeCameraTooltip');montageFreeCamera.append(freeCameraControl);legacyPovControls.remove();renderPov=()=>{montageFreeCamera.hidden=state.meta?.kind!=='POV'};$('#freeCamera').onchange=renderPov;
 const rawShowEventTip=showEventTip;
 showEventTip=(...args)=>{$('#track').classList.add('tip-open');rawShowEventTip(...args)};
+document.body.append($('#eventTip'));
 $('#track').addEventListener('mouseleave',()=>$('#track').classList.remove('tip-open'));
 const rawTrackMove=$('#track').onmousemove;
 $('#track').onmousemove=e=>{rawTrackMove(e);if($('#eventTip').style.display==='none')$('#track').classList.remove('tip-open')};
-$('#downloadMontage').onclick=e=>{if(!state.ranges.length)return say(tr('addFirst'),true);post('/api/edit',{id:state.id,ranges:state.ranges,freeCamera:$('#freeCamera').checked,name:montageName.value},e.currentTarget)};
+const CLIP_PALETTE=['#cf6a35','#1f8f6f','#3d6fa8','#c98a1f','#8461c9','#c0463d'];
+const clipColor=(range,index)=>{if(!range[2]){const used=new Set(state.ranges.map(item=>item[2]).filter(Boolean));range[2]=CLIP_PALETTE.find(color=>!used.has(color))||CLIP_PALETTE[index%CLIP_PALETTE.length]}return range[2]};
+const hexAlpha=(color,alpha)=>{const value=color.replace('#','');const rgb=value.length===3?[...value].map(x=>parseInt(x+x,16)):[value.slice(0,2),value.slice(2,4),value.slice(4,6)].map(x=>parseInt(x,16));return `rgba(${rgb.join(',')},${alpha})`};
+function drawOutputMini(){if(!state.meta)return;const meta=state.meta,density=meta.density||[],peak=Math.max(1,[...density].sort((a,b)=>a-b)[Math.floor(density.length*.9)]||1),style=getComputedStyle(document.documentElement);document.querySelectorAll('#outputTrack .output-clip').forEach(clip=>{const range=state.ranges[+clip.dataset.index],canvas=clip.querySelector('canvas'),box=canvas.getBoundingClientRect(),d=devicePixelRatio||1;if(!range||!box.width)return;canvas.width=Math.round(box.width*d);canvas.height=Math.round(box.height*d);const x=canvas.getContext('2d'),color=clipColor(range,+clip.dataset.index),from=Math.floor(range[0]/meta.ticks*density.length),to=Math.max(from+1,Math.ceil(range[1]/meta.ticks*density.length)),span=Math.max(1,to-from),unit=box.width/span;x.setTransform(d,0,0,d,0,0);x.clearRect(0,0,box.width,box.height);x.fillStyle=hexAlpha(color,.88);x.fillRect(0,0,box.width,box.height);x.fillStyle='rgba(0,0,0,.46)';for(let bin=from;bin<to;bin++){const h=box.height*(.14+.7*Math.min(1,(density[bin]||0)/peak));x.fillRect((bin-from)*unit+1,box.height-h,Math.max(1,unit-1),h)}for(const event of state.events){const spec=EVENT_STYLE[event.kind];if(!spec||event.tick<range[0]||event.tick>range[1]||(state.eventFilters&&!state.eventFilters.has(event.kind)))continue;const px=(event.tick-range[0])/(range[1]-range[0])*box.width,h=Math.max(12,box.height*spec[2]);x.fillStyle=style.getPropertyValue(spec[1]);x.fillRect(px-1.5,box.height-h,3,h)}})}
+const renderSegmentsRich=renderSegments;
+renderSegments=()=>{state.ranges.forEach(clipColor);renderSegmentsRich();const meta=state.meta,total=state.ranges.reduce((sum,range)=>sum+range[1]-range[0],0)||1;$('#savedRanges').innerHTML=state.ranges.map((range,index)=>`<i class="range-mark" style="left:${range[0]/meta.ticks*100}%;width:${(range[1]-range[0])/meta.ticks*100}%;background:${clipColor(range,index)}"></i>`).join('');$('#outputTrack').innerHTML=state.ranges.map((range,index)=>{const width=(range[1]-range[0])/total*100;return `<div class="output-clip" draggable="true" data-index="${index}" style="flex:0 0 ${width}%;width:${width}%;--clip:${clipColor(range,index)}"><b class="output-order">#${index+1}</b><canvas aria-hidden="true"></canvas><span class="output-range">${fmt(range[0]/meta.tickRate)} → ${fmt(range[1]/meta.tickRate)}</span></div>`}).join('');const points=[0];state.ranges.reduce((sum,range)=>(points.push(sum+range[1]-range[0]),sum+range[1]-range[0]),0);const axisWidth=$('#outputTrack').clientWidth||600;$('#outputTickAxis').innerHTML=points.map((value,index)=>{const previous=points[index-1]??value,next=points[index+1]??value,room=Math.min(value-previous,next-value)/total*axisWidth;const hidden=index>0&&index<points.length-1&&room<52;return `<span class="${hidden?'axis-hidden':''}" style="left:${value/total*100}%;transform:translateX(${index===0?'0':index===points.length-1?'-100%':'-50%'})">${value.toLocaleString(locale())}</span>`}).join('');$('#outputTimeAxis').innerHTML='';drawOutputMini()};
+const drawWithOutputMini=draw;draw=()=>{drawWithOutputMini();drawOutputMini()};
+$('#outputTrack').addEventListener('mousemove',event=>{const clip=event.target.closest('.output-clip'),meta=state.meta;if(!clip||!meta)return;const range=state.ranges[+clip.dataset.index],rect=clip.getBoundingClientRect(),tick=range[0]+Math.max(0,Math.min(1,(event.clientX-rect.left)/rect.width))*(range[1]-range[0]),near=state.events.filter(item=>EVENT_STYLE[item.kind]&&item.tick>=range[0]&&item.tick<=range[1]&&(!state.eventFilters||state.eventFilters.has(item.kind))).reduce((best,item)=>!best||Math.abs(item.tick-tick)<Math.abs(best.tick-tick)?item:best,null);if(!near||Math.abs(near.tick-tick)>(range[1]-range[0])/Math.max(20,rect.width/5)){$('#eventTip').style.display='none';return}showEventTip(near,event.clientX,event.clientY)});
+$('#outputTrack').addEventListener('mouseleave',()=>$('#eventTip').style.display='none');
+$('#downloadMontage').onclick=e=>{if(!state.ranges.length)return say(tr('addFirst'),true);post('/api/edit',{id:state.id,ranges:state.ranges.map(range=>range.slice(0,2)),freeCamera:$('#freeCamera').checked,name:montageName.value},e.currentTarget)};
 </script></body>""",
 )
 
@@ -816,6 +835,20 @@ class DemoServer(ThreadingHTTPServer):
         self.workspace = Path(workspace)
         self.sessions = {}  # ponytail: local single-user process; add expiry only for remote hosting.
         self.lock = threading.Lock()
+        for directory in self.workspace.rglob("*"):
+            if not directory.is_dir() or not re.fullmatch(r"[0-9a-f]{32}", directory.name):
+                continue
+            demos = sorted(directory.glob("*.dem"), key=lambda path: path.stat().st_mtime)
+            if not demos:
+                continue
+            try:
+                self.sessions[directory.name] = {
+                    "dir": directory,
+                    "info": read_demo(demos[0]),
+                    "voice": directory / "voice",
+                }
+            except (OSError, ValueError):
+                continue
 
 
 class DemoHandler(BaseHTTPRequestHandler):
@@ -1112,13 +1145,13 @@ def main():
         if args.command in (None, "serve"):
             host, port = getattr(args, "host", "127.0.0.1"), getattr(args, "port", 8765)
             workspace_root = Path(getattr(args, "workspace", DEFAULT_WORKSPACE)).resolve()
-            with temporary_directory("session_", workspace_root) as workspace:
-                server = DemoServer((host, port), workspace)
-                url = f"http://{host}:{port}"
-                print(f"TF2 Demo Tools: {url} (Ctrl+C to stop)")
-                if not getattr(args, "no_browser", False):
-                    threading.Timer(0.4, webbrowser.open, args=(url,)).start()
-                server.serve_forever()
+            workspace_root.mkdir(parents=True, exist_ok=True)
+            server = DemoServer((host, port), workspace_root)
+            url = f"http://{host}:{port}"
+            print(f"TF2 Demo Tools: {url} (Ctrl+C to stop)")
+            if not getattr(args, "no_browser", False):
+                threading.Timer(0.4, webbrowser.open, args=(url,)).start()
+            server.serve_forever()
         elif args.command == "self-test":
             self_check()
         elif args.command == "info":
