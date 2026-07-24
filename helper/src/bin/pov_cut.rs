@@ -326,22 +326,9 @@ mod tests {
 }
 
 fn main() -> Result<(), MainError> {
-    let mut free_camera = false;
-    let args = env::args()
-        .skip(1)
-        .filter(|arg| {
-            if arg == "--free-camera" {
-                free_camera = true;
-                false
-            } else {
-                true
-            }
-        })
-        .collect::<Vec<_>>();
+    let args: Vec<_> = env::args().skip(1).collect();
     if args.len() != 4 {
-        eprintln!(
-            "usage: pov_cut [--free-camera] <input.dem> <output.dem> <start-tick> <end-tick>"
-        );
+        eprintln!("usage: pov_cut <input.dem> <output.dem> <start-tick> <end-tick>");
         std::process::exit(2);
     }
     let input = fs::read(&args[0])?;
@@ -434,7 +421,7 @@ fn main() -> Result<(), MainError> {
                     previous_output_tick = Some(server_tick);
                     full_entities_written = true;
                 }
-                if first_user_cmd && !free_camera {
+                if first_user_cmd {
                     if let (Packet::UserCmd(packet), Some(absolute)) =
                         (&mut item.packet, item.user_cmd.take())
                     {
@@ -444,7 +431,6 @@ fn main() -> Result<(), MainError> {
                 }
                 if item.packet.packet_type() == PacketType::SyncTick
                     || item.packet.packet_type() == PacketType::StringTables
-                    || (free_camera && item.packet.packet_type() == PacketType::UserCmd)
                 {
                     continue;
                 }
@@ -467,7 +453,6 @@ fn main() -> Result<(), MainError> {
         if selected {
             if packet.packet_type() != PacketType::SyncTick
                 && (start == 0 || packet.packet_type() != PacketType::StringTables)
-                && (!free_camera || packet.packet_type() != PacketType::UserCmd)
             {
                 let mut output_packet = packet.clone();
                 output_packet.set_tick((tick - start + warmup_ticks).into());
@@ -528,7 +513,8 @@ fn main() -> Result<(), MainError> {
     header.duration = header.ticks as f32 / tick_rate;
     header.frames = frames;
 
-    let mut output = Vec::with_capacity(header_bytes + header.signon as usize + body.len());
+    let signon = &input[header_bytes..signon_end_bytes];
+    let mut output = Vec::with_capacity(header_bytes + signon.len() + body.len());
     {
         let mut output_stream = BitWriteStream::new(&mut output, LittleEndian);
         header.write(&mut output_stream)?;
@@ -536,7 +522,7 @@ fn main() -> Result<(), MainError> {
     if output.len() != header_bytes || signon_end_bytes > input.len() {
         return Err("invalid demo sign-on boundary".into());
     }
-    output.extend_from_slice(&input[header_bytes..signon_end_bytes]);
+    output.extend_from_slice(signon);
     output.extend_from_slice(&body);
     fs::write(&args[1], output)?;
     eprintln!(
