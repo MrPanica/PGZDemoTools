@@ -29,6 +29,15 @@ CMD_SIGNON, CMD_PACKET, CMD_SYNCTICK = 1, 2, 3
 CMD_CONSOLE, CMD_USER, CMD_DATATABLES, CMD_STOP, CMD_STRINGTABLES = 4, 5, 6, 7, 8
 MAX_UPLOAD = 8 * 1024**3
 SILENCE_OPUS = b"\xf8\xff\xfe"  # Valid 20 ms Opus DTX packet.
+DEFAULT_WORKSPACE = Path(
+    os.environ.get("PGZ_DEMO_WORKSPACE", Path(__file__).resolve().parent / ".work")
+)
+
+
+def temporary_directory(prefix: str, root: Path = DEFAULT_WORKSPACE):
+    root = Path(root).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    return tempfile.TemporaryDirectory(prefix=prefix, dir=root)
 
 
 def i32(data: bytes, offset: int) -> int:
@@ -410,7 +419,7 @@ def join_pov_fragments(paths, target: Path):
 
 def write_pov_edit(info, ranges, target: Path, free_camera=False):
     if len(ranges) > 1:
-        with tempfile.TemporaryDirectory(prefix="pov_montage_") as workspace:
+        with temporary_directory("pov_montage_") as workspace:
             fragments = []
             for index, current in enumerate(ranges):
                 fragment = Path(workspace) / f"{index}.dem"
@@ -989,7 +998,7 @@ def split_demo(source: Path, output: Path, parts=None, seconds=None):
 def export_voices(source: Path, output: Path, queries, all_players: bool, keep_gaps: bool, audio_format="ogg"):
     info = read_demo(source)
     output.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="tf2_voice_") as temporary:
+    with temporary_directory("tf2_voice_") as temporary:
         dump = Path(temporary)
         players = extract_voice_index(source, dump)
         selected = players if all_players else [
@@ -1055,6 +1064,12 @@ def main():
     serve = commands.add_parser("serve", help="start the local web editor")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8765)
+    serve.add_argument(
+        "--workspace",
+        type=Path,
+        default=DEFAULT_WORKSPACE,
+        help="directory for temporary web sessions (default: .work next to the script)",
+    )
     serve.add_argument("--no-browser", action="store_true")
     info_cmd = commands.add_parser("info", help="show demo metadata")
     info_cmd.add_argument("demo", type=Path)
@@ -1096,7 +1111,8 @@ def main():
     try:
         if args.command in (None, "serve"):
             host, port = getattr(args, "host", "127.0.0.1"), getattr(args, "port", 8765)
-            with tempfile.TemporaryDirectory(prefix="tf2_demo_tools_") as workspace:
+            workspace_root = Path(getattr(args, "workspace", DEFAULT_WORKSPACE)).resolve()
+            with temporary_directory("session_", workspace_root) as workspace:
                 server = DemoServer((host, port), workspace)
                 url = f"http://{host}:{port}"
                 print(f"TF2 Demo Tools: {url} (Ctrl+C to stop)")

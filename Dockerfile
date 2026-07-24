@@ -13,4 +13,4 @@ COPY --from=helper /src/helper/target/release/pov_cut /app/pov_cut
 RUN chmod +x /app/voice_extract /app/pov_cut && useradd -r -u 10001 demo
 USER demo
 EXPOSE 8765
-CMD ["python", "demo_tools.py", "serve", "--host", "0.0.0.0", "--port", "8765", "--no-browser"]
+CMD ["python", "demo_tools.py", "serve", "--host", "0.0.0.0", "--port", "8765", "--workspace", "/tmp/pgz-demo-tools", "--no-browser"]

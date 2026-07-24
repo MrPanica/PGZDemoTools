@@ -11,6 +11,8 @@ python3 demo_tools.py build-helper
 python3 demo_tools.py serve --host 127.0.0.1 --port 8765
 ```
 
+Web sessions are stored in `.work` next to the script. Override this with `--workspace PATH` or `PGZ_DEMO_WORKSPACE`.
+
 CLI examples:
 
 ```sh
@@ -56,6 +58,8 @@ Different `.dem` files are intentionally not joined: TF2 network state becomes i
 python3 demo_tools.py build-helper
 python3 demo_tools.py serve --host 127.0.0.1 --port 8765
 ```
+
+Веб-сессии хранятся в `.work` рядом со скриптом. Путь можно изменить через `--workspace PATH` или `PGZ_DEMO_WORKSPACE`.
 
 Примеры CLI:
 

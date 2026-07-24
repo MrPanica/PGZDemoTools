@@ -1,4 +1,5 @@
 .build/
+.work/
 build/
 build-linux/
 dist/
