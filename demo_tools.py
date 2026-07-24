@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import binascii
-from concurrent.futures import ThreadPoolExecutor
 import json
 import math
 import os
@@ -161,34 +160,57 @@ def normalize_ranges(ranges, ticks, ordered=False):
 def write_edit(info, ranges, target: Path):
     ranges = normalize_ranges(ranges, info["ticks"], ordered=True)
     if info["kind"] == "POV":
-        return write_pov_edit(info, ranges, target)
+        return write_checkpoint_edit(info, ranges, target)
+    return write_source_web(info, ranges, target)
+
+
+def bridge_tick(cursor, index, total, ticks):
+    return cursor + index * ticks // total if ticks else cursor
+
+
+def write_source_web(
+    info,
+    ranges,
+    target: Path,
+    normalize_packet_sequences=False,
+    bridge_as_packets=False,
+    bridge_ticks=0,
+    replay_full_history=False,
+):
+    """Stable SourceTV path used by the web editor and normal CLI commands."""
     body = info["body"]
+
     def selected(record, start, end, is_last):
-        # TF2 writes a final packet/usercmd exactly at playback_ticks.  Keeping
-        # it prevents a valid POV demo from ending with an incomplete state.
         return start <= record[3] < end or (is_last and record[3] == end)
 
+    def bridge_records(previous_end, start):
+        if previous_end is None:
+            return []
+        bridge_start = 0 if replay_full_history or previous_end > start else previous_end
+        # ponytail: replaying packet history is enough for the CLI experiment; add mid-demo stringtables only if a demo proves it necessary.
+        return [
+            record
+            for record in body
+            if record[2] == CMD_PACKET and bridge_start <= record[3] < start
+        ]
+
     first_start = ranges[0][0]
-    is_pov = info["kind"] == "POV"
     initial_warmup = [
-        r
-        for r in body
-        if r[3] < first_start
-        and (r[2] == CMD_PACKET or is_pov and r[2] in (CMD_SYNCTICK, CMD_STRINGTABLES))
+        record for record in body if record[2] == CMD_PACKET and record[3] < first_start
     ]
-    if is_pov and first_start and not any(r[2] == CMD_STRINGTABLES for r in initial_warmup):
-        raise ValueError("POV demo has no initial string-table snapshot; safe clipping is unavailable")
     selected_packets = [
-        r
+        record
         for index, (start, end) in enumerate(ranges)
-        for r in body
-        if r[2] == CMD_PACKET and selected(r, start, end, index == len(ranges) - 1)
+        for record in body
+        if record[2] == CMD_PACKET and selected(record, start, end, index == len(ranges) - 1)
     ]
     if not selected_packets:
         raise ValueError("selection contains no demo packets")
-    output_ticks = sum(end - start for start, end in ranges)
+    bridges = [bridge_records(previous[1], start) for previous, (start, _end) in zip(ranges, ranges[1:])]
+    bridge_frames = sum(len(bridge) for bridge in bridges)
+    bridge_count = sum(bool(bridge) for bridge in bridges)
+    output_ticks = sum(end - start for start, end in ranges) + (bridge_ticks * bridge_count if bridge_as_packets else 0)
     startup = info["data"][HEADER_SIZE : info["signon_end"]]
-    warmup_size = sum(r[1] - r[0] for r in initial_warmup if r[2] == CMD_PACKET)
     header = bytearray(info["data"][:HEADER_SIZE])
     struct.pack_into(
         "<fiii",
@@ -196,48 +218,49 @@ def write_edit(info, ranges, target: Path):
         PLAYBACK_OFFSET,
         output_ticks / info["tick_rate"],
         output_ticks,
-        len(selected_packets),
-        len(startup) if is_pov else len(startup) + warmup_size,
+        len(selected_packets) + (bridge_frames if bridge_as_packets else 0),
+        len(startup) + sum(record[1] - record[0] for record in initial_warmup),
     )
-    target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_suffix(target.suffix + ".tmp")
+    target.parent.mkdir(parents=True, exist_ok=True)
     try:
         with temporary.open("wb") as output:
             output.write(header)
             output.write(startup)
             for record in initial_warmup:
-                output.write(
-                    rewritten_record(
-                        info,
-                        record,
-                        command=CMD_SIGNON if record[2] == CMD_PACKET else None,
-                    )
-                )
+                output.write(rewritten_record(info, record, command=CMD_SIGNON))
             output.write(struct.pack("<Bi", CMD_SYNCTICK, 0))
-            cursor, previous_end = 0, None
+            cursor, previous_end, next_sequence = 0, None, None
             for index, (start, end) in enumerate(ranges):
                 if previous_end is not None:
-                    for record in body:
-                        if (
-                            record[2] in (CMD_PACKET, CMD_STRINGTABLES)
-                            and previous_end <= record[3] < start
-                        ):
-                            output.write(
-                                rewritten_record(
-                                    info,
-                                    record,
-                                    command=CMD_SIGNON if record[2] == CMD_PACKET else None,
-                                    tick=cursor,
-                                )
-                            )
-                for record in body:
-                    if (
-                        record[2] != CMD_SYNCTICK
-                        and selected(record, start, end, index == len(ranges) - 1)
-                    ):
+                    bridge = bridge_records(previous_end, start)
+                    packets = bridge
+                    packet_index = 0
+                    for record in bridge:
+                        command = CMD_PACKET if bridge_as_packets else CMD_SIGNON
+                        tick = cursor
+                        if bridge_as_packets:
+                            tick = bridge_tick(cursor, packet_index, len(packets), bridge_ticks)
+                            packet_index += 1
                         output.write(
-                            rewritten_record(info, record, tick=cursor + record[3] - start)
+                            rewritten_record(
+                                info,
+                                record,
+                                command=command,
+                                tick=tick,
+                            )
                         )
+                    if bridge_as_packets and bridge:
+                        cursor += bridge_ticks
+                for record in body:
+                    if record[2] != CMD_SYNCTICK and selected(record, start, end, index == len(ranges) - 1):
+                        rewritten = rewritten_record(info, record, tick=cursor + record[3] - start)
+                        if normalize_packet_sequences and record[2] == CMD_PACKET:
+                            if next_sequence is None:
+                                next_sequence = struct.unpack_from("<I", rewritten, 81)[0]
+                            struct.pack_into("<II", rewritten, 81, next_sequence, next_sequence)
+                            next_sequence = (next_sequence + 1) & 0xFFFFFFFF
+                        output.write(rewritten)
                 cursor += end - start
                 previous_end = end
             output.write(struct.pack("<Bi", CMD_STOP, output_ticks))
@@ -245,7 +268,40 @@ def write_edit(info, ranges, target: Path):
     finally:
         if temporary.exists():
             temporary.unlink()
-    verify_edit(target, output_ticks, len(selected_packets))
+    verify_edit(
+        target,
+        output_ticks,
+        len(selected_packets) + (bridge_frames if bridge_as_packets else 0),
+    )
+    return target
+
+
+def write_source_experiment(info, ranges, target: Path):
+    """Cut SourceTV with a state checkpoint at every range boundary."""
+    temporary = target.with_suffix(target.suffix + ".tmp")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        command = [str(helper_binary("pov_cut")), str(info["path"]), str(temporary), "--montage"]
+        command.extend(str(tick) for pair in ranges for tick in pair)
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=900,
+        )
+        if result.returncode:
+            detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+            raise ValueError(f"pov_cut failed: {detail}")
+        os.replace(temporary, target)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    expected_ticks = sum(end - start for start, end in ranges)
+    edited = read_demo(target)
+    if not edited["complete_stop"] or edited["ticks"] != expected_ticks:
+        raise ValueError("SourceTV montage verification failed")
     return target
 
 
@@ -384,8 +440,8 @@ def voice_helper() -> Path:
     return helper_binary("voice_extract")
 
 
-def join_pov_fragments(paths, target: Path):
-    """Join independently checkpointed POV fragments without a second sign-on."""
+def join_checkpoint_fragments(paths, target: Path):
+    """Join independently checkpointed fragments without a second sign-on."""
     infos = [read_demo(path) for path in paths]
     first = infos[0]
     ticks = sum(info["ticks"] for info in infos)
@@ -403,6 +459,8 @@ def join_pov_fragments(paths, target: Path):
             output.write(startup)
             cursor = 0
             for index, info in enumerate(infos):
+                if index:
+                    output.write(struct.pack("<Bi", CMD_SYNCTICK, cursor))
                 for record in info["body"]:
                     if record[2] == CMD_STOP or index and record[2] == CMD_SYNCTICK:
                         continue
@@ -417,24 +475,20 @@ def join_pov_fragments(paths, target: Path):
     return target
 
 
-def write_pov_edit(info, ranges, target: Path):
+def write_checkpoint_edit(info, ranges, target: Path, server_tick_offset=0):
     if len(ranges) > 1:
         with temporary_directory("pov_montage_") as workspace:
             fragments = [Path(workspace) / f"{index}.dem" for index in range(len(ranges))]
-            # ponytail: two helpers avoid rereading a large POV demo serially; raise only if memory allows.
-            with ThreadPoolExecutor(max_workers=min(2, len(ranges))) as pool:
-                jobs = [
-                    pool.submit(write_pov_edit, info, [current], fragment)
-                    for current, fragment in zip(ranges, fragments)
-                ]
-                for job in jobs:
-                    job.result()
-            return join_pov_fragments(fragments, target)
+            server_tick_offset = 0
+            for current, fragment in zip(ranges, fragments):
+                write_checkpoint_edit(info, [current], fragment, server_tick_offset)
+                server_tick_offset += read_demo(fragment)["ticks"]
+            return join_checkpoint_fragments(fragments, target)
     start, end = ranges[0]
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_suffix(target.suffix + ".tmp")
     command = [str(helper_binary("pov_cut"))]
-    command.extend((str(info["path"]), str(temporary), str(start), str(end)))
+    command.extend((str(info["path"]), str(temporary), str(start), str(end), str(server_tick_offset)))
     try:
         result = subprocess.run(
             command,
@@ -691,7 +745,7 @@ body{background:var(--bg);font-size:14px;letter-spacing:0}.shell{width:min(1180p
 <header class="top"><div class="brand"><i></i>TF2 DEMO TOOLS</div><div class="top-actions"><div id="languageMenu" class="language-menu"><button id="languageButton" class="language-button" type="button" aria-haspopup="menu" aria-expanded="false"><span id="languageFlag" class="flag flag-ru" aria-hidden="true"></span><span id="languageLabel">Русский</span><svg aria-hidden="true" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"/></svg></button><div id="languageOptions" class="language-options" role="menu"><button type="button" value="system" role="menuitemradio"><span id="systemFlag" class="flag flag-ru" aria-hidden="true"></span><span data-t="systemLanguage">Язык системы</span></button><button type="button" value="ru" role="menuitemradio"><span class="flag flag-ru" aria-hidden="true"></span><span>Русский</span></button><button type="button" value="en" role="menuitemradio"><span class="flag flag-en" aria-hidden="true"></span><span>English</span></button></div></div><div id="themeMenu" class="theme-menu"><button id="themeButton" class="theme-button" type="button" aria-haspopup="menu" aria-expanded="false" aria-label="Тема" title="Тема системы"><span id="themeIcon" aria-hidden="true">◐</span></button><div id="theme" class="theme-options" role="menu" aria-label="Тема"><button type="button" value="system" role="menuitemradio" data-t-title="systemTheme" title="Тема системы" aria-label="Тема системы"><span aria-hidden="true">◐</span></button><button type="button" value="light" role="menuitemradio" data-t-title="lightTheme" title="Светлая" aria-label="Светлая"><span aria-hidden="true">☀</span></button><button type="button" value="dark" role="menuitemradio" data-t-title="darkTheme" title="Тёмная" aria-label="Тёмная"><span aria-hidden="true">☾</span></button></div></div><button id="reset" class="ghost hidden" data-t="otherDemo">Другая демка</button></div></header>
 <section id="intro"><div class="hero"><div class="eyebrow" data-t="eyebrow">Локальный редактор</div><h1 id="heroTitle">Монтаж TF2-демок<br>без лишних шагов.</h1><p data-t="heroText">POV и SourceTV, события, точная шкала тиков, монтаж отрезков и голоса игроков. Файл обрабатывается локально.</p></div>
 <div id="drop" class="drop" tabindex="0"><strong data-t="dropTitle">Перетащите сюда .dem</strong><span data-t="dropText">или выберите файл с диска</span><br><button id="pick" class="primary" data-t="pickDemo">Выбрать демку</button><input id="file" type="file" accept=".dem" hidden></div></section>
-<div id="status" class="status" role="status" aria-live="polite"></div><input id="freeCamera" type="checkbox" hidden aria-hidden="true">
+<div id="status" class="status" role="status" aria-live="polite"></div>
 <section id="workspace" class="workspace hidden">
 <div class="demo-head info-card"><div class="demo-title"><div><h2 id="demoName"></h2><div id="demoSub" class="sub"></div></div></div><div id="badges" class="badges"></div><div id="stats" class="stats metrics-grid"></div></div>
 <div class="layout"><aside class="sidebar panel"><div class="players-card"><div class="panel-head"><div id="playerTabs" class="player-tabs" role="tablist"><button type="button" value="voices" role="tab" aria-selected="true" data-t="voicesTitle">Голоса игроков</button><button type="button" value="all" role="tab" aria-selected="false" data-t="demoPlayers">Игроки в демке</button></div><button id="toggleAll" class="ghost" data-t="selectAll">Выбрать всех</button></div><div class="search-mini"><input id="playerSearch" type="search" data-t-placeholder="findPlayer" placeholder="Найти игрока"></div><div id="players" class="players"><span class="sub" data-t="loadingVoices">Ищу голосовые дорожки…</span></div><div id="voiceOnly"><div class="audio-options"><label class="switch"><input id="keepGaps" type="checkbox" checked> <span data-t="keepGaps">Оставить паузы как в демке</span></label><label class="audio-format"><span data-t="audioFormat">Формат звука</span><select id="audioFormat" class="control"><option value="ogg">OGG · Opus</option><option value="wav">WAV · PCM</option><option value="mp3">MP3 · 128 kbps</option></select></label></div><div class="actions"><button id="downloadVoices" class="primary" data-t="downloadAudio">Скачать аудио</button><button id="downloadAllVoices" class="ghost" data-t="downloadArchive">Скачать всех .zip</button></div><div id="audioNote" class="note"></div></div></div></aside>
@@ -747,7 +801,7 @@ let dragIndex=-1;function moveRange(from,to){if(from===to||from<0||to<0)return;c
 $('#outputTrack').addEventListener('dragstart',e=>{const clip=e.target.closest('.output-clip');if(!clip)return;dragIndex=+clip.dataset.index;clip.classList.add('dragging');e.dataTransfer.effectAllowed='move'});$('#outputTrack').addEventListener('dragend',()=>{dragIndex=-1;document.querySelectorAll('.output-clip').forEach(clip=>clip.classList.remove('dragging'))});
 let outputPointerIndex=-1;function dropOutputRange(clientX){if(outputPointerIndex<0)return;const track=$('#outputTrack'),rect=track.getBoundingClientRect(),total=state.ranges.reduce((sum,range)=>sum+range[1]-range[0],0),point=(clientX-rect.left)/rect.width*total;let sum=0,to=state.ranges.findIndex(range=>(sum+=range[1]-range[0])>=point);moveRange(outputPointerIndex,to<0?state.ranges.length:to);outputPointerIndex=-1;document.querySelectorAll('.output-clip').forEach(clip=>clip.classList.remove('dragging'))}$('#outputTrack').addEventListener('pointerdown',e=>{const clip=e.target.closest('.output-clip');if(!clip)return;e.preventDefault();outputPointerIndex=+clip.dataset.index;clip.classList.add('dragging');e.currentTarget.setPointerCapture?.(e.pointerId)});$('#outputTrack').addEventListener('pointerup',e=>dropOutputRange(e.clientX));$('#outputTrack').addEventListener('pointercancel',()=>{outputPointerIndex=-1;document.querySelectorAll('.output-clip').forEach(clip=>clip.classList.remove('dragging'))});
 $('#downloadMontage').onclick=e=>{if(!state.ranges.length)return say(tr('addFirst'),true);post('/api/edit',{id:state.id,ranges:state.ranges},e.currentTarget)};
-$('#toggleAll').onclick=()=>{const boxes=[...document.querySelectorAll('#players input')],on=boxes.some(input=>!input.checked);boxes.forEach(input=>input.checked=on)};$('#playerSearch').oninput=e=>{const q=e.target.value.trim().toLowerCase();document.querySelectorAll('#players .player').forEach(row=>row.hidden=!row.textContent.toLowerCase().includes(q))};$('#downloadVoices').onclick=e=>downloadVoices(e.currentTarget);$('#downloadAllVoices').onclick=e=>{const clients=state.players.map(player=>player.client);if(clients.length)post('/api/voice',{id:state.id,clients,keepGaps:$('#keepGaps').checked},e.currentTarget)};$('#audioFormat').onchange=updateAudioNote;$('#freeCamera').onchange=renderPov;$('#languageButton').onclick=()=>{const menu=$('#languageMenu'),open=!menu.classList.contains('open');menu.classList.toggle('open',open);$('#languageButton').setAttribute('aria-expanded',open);$('#themeMenu').classList.remove('open');$('#themeButton').setAttribute('aria-expanded','false')};$('#languageOptions').onclick=e=>{const button=e.target.closest('button[value]');if(!button)return;applyLanguage(button.value);$('#languageMenu').classList.remove('open');$('#languageButton').setAttribute('aria-expanded','false')};$('#themeButton').onclick=()=>{const menu=$('#themeMenu'),open=!menu.classList.contains('open');menu.classList.toggle('open',open);$('#themeButton').setAttribute('aria-expanded',open);$('#languageMenu').classList.remove('open');$('#languageButton').setAttribute('aria-expanded','false')};$('#theme').onclick=e=>{const button=e.target.closest('button[value]');if(!button)return;applyTheme(button.value);$('#themeMenu').classList.remove('open');$('#themeButton').setAttribute('aria-expanded','false')};document.addEventListener('click',e=>{if(!e.target.closest('#languageMenu')){$('#languageMenu').classList.remove('open');$('#languageButton').setAttribute('aria-expanded','false')}if(!e.target.closest('#themeMenu')){$('#themeMenu').classList.remove('open');$('#themeButton').setAttribute('aria-expanded','false')}});window.addEventListener('languagechange',()=>{languageSetting==='system'&&applyLanguage('system')});matchMedia('(prefers-color-scheme: dark)').addEventListener('change',()=>{choiceValue('theme')==='system'&&state.meta&&draw()});applyTheme(localStorage.getItem('demoToolsTheme')||'system');applyLanguage(localStorage.getItem('demoToolsLanguage')||'system');
+$('#toggleAll').onclick=()=>{const boxes=[...document.querySelectorAll('#players input')],on=boxes.some(input=>!input.checked);boxes.forEach(input=>input.checked=on)};$('#playerSearch').oninput=e=>{const q=e.target.value.trim().toLowerCase();document.querySelectorAll('#players .player').forEach(row=>row.hidden=!row.textContent.toLowerCase().includes(q))};$('#downloadVoices').onclick=e=>downloadVoices(e.currentTarget);$('#downloadAllVoices').onclick=e=>{const clients=state.players.map(player=>player.client);if(clients.length)post('/api/voice',{id:state.id,clients,keepGaps:$('#keepGaps').checked},e.currentTarget)};$('#audioFormat').onchange=updateAudioNote;$('#languageButton').onclick=()=>{const menu=$('#languageMenu'),open=!menu.classList.contains('open');menu.classList.toggle('open',open);$('#languageButton').setAttribute('aria-expanded',open);$('#themeMenu').classList.remove('open');$('#themeButton').setAttribute('aria-expanded','false')};$('#languageOptions').onclick=e=>{const button=e.target.closest('button[value]');if(!button)return;applyLanguage(button.value);$('#languageMenu').classList.remove('open');$('#languageButton').setAttribute('aria-expanded','false')};$('#themeButton').onclick=()=>{const menu=$('#themeMenu'),open=!menu.classList.contains('open');menu.classList.toggle('open',open);$('#themeButton').setAttribute('aria-expanded',open);$('#languageMenu').classList.remove('open');$('#languageButton').setAttribute('aria-expanded','false')};$('#theme').onclick=e=>{const button=e.target.closest('button[value]');if(!button)return;applyTheme(button.value);$('#themeMenu').classList.remove('open');$('#themeButton').setAttribute('aria-expanded','false')};document.addEventListener('click',e=>{if(!e.target.closest('#languageMenu')){$('#languageMenu').classList.remove('open');$('#languageButton').setAttribute('aria-expanded','false')}if(!e.target.closest('#themeMenu')){$('#themeMenu').classList.remove('open');$('#themeButton').setAttribute('aria-expanded','false')}});window.addEventListener('languagechange',()=>{languageSetting==='system'&&applyLanguage('system')});matchMedia('(prefers-color-scheme: dark)').addEventListener('change',()=>{choiceValue('theme')==='system'&&state.meta&&draw()});applyTheme(localStorage.getItem('demoToolsTheme')||'system');applyLanguage(localStorage.getItem('demoToolsLanguage')||'system');
 async function restoreSession(){let saved;try{const shared=new URLSearchParams(location.search).get('session');saved=shared?{id:shared}:JSON.parse(localStorage.getItem('tf2DemoToolsSession')||'null')}catch(_){localStorage.removeItem('tf2DemoToolsSession');return}if(!saved?.id)return;try{const r=await fetch('/api/session?id='+saved.id),data=await r.json();if(!r.ok)throw new Error(data.error);state={id:data.id,meta:data.meta,ranges:Array.isArray(saved.ranges)?saved.ranges:[],players:[],allPlayers:[],playerTab:'voices',events:[],eventsLoaded:false,hit:[],selectionReady:true};render();$('#startRange').value=saved.selection?.[0]??0;$('#endRange').value=saved.selection?.[1]??data.meta.ticks;syncSelection();renderSegments();intro.classList.add('hidden');workspace.classList.remove('hidden');$('#reset').classList.remove('hidden');say(tr('ready'));loadVoices()}catch(_){localStorage.removeItem('tf2DemoToolsSession')}}restoreSession();
 </script></body></html>'''
 
@@ -1073,6 +1127,7 @@ def self_check():
     assert opus_samples_48k(SILENCE_OPUS) == 960
     assert normalize_ranges([(5, 9), (1, 3), (3, 6)], 10) == [(1, 9)]
     assert normalize_ranges([(5, 9), (1, 3)], 10, ordered=True) == [(5, 9), (1, 3)]
+    assert [bridge_tick(10, index, 5, 3) for index in range(5)] == [10, 10, 11, 11, 12]
     page = ogg_page(b"x", 1, 0, 0, 2)
     stored, clean = struct.unpack_from("<I", page, 22)[0], bytearray(page)
     struct.pack_into("<I", clean, 22, 0)
@@ -1112,6 +1167,14 @@ def main():
         help="START:END seconds; repeat in output order",
     )
     montage.add_argument("-o", "--output", type=Path)
+    source_test = commands.add_parser(
+        "source-montage-test", help="experimental SourceTV state-rebuild montage (CLI only)"
+    )
+    source_test.add_argument("demo", type=Path)
+    source_test.add_argument(
+        "--range", action="append", required=True, help="START:END seconds; repeat in output order"
+    )
+    source_test.add_argument("-o", "--output", type=Path)
     split = commands.add_parser("split", help="split into independent parts")
     split.add_argument("demo", type=Path)
     group = split.add_mutually_exclusive_group()
@@ -1155,6 +1218,18 @@ def main():
             target = args.output or args.demo.with_name(args.demo.stem + ".montage.dem")
             ranges = [(round(start * info["tick_rate"]), round(end * info["tick_rate"])) for start, end in map(parse_time_range, args.range)]
             write_edit(info, ranges, target)
+            print(target)
+        elif args.command == "source-montage-test":
+            info = read_demo(args.demo)
+            if info["kind"] != "SourceTV":
+                raise ValueError("source-montage-test accepts SourceTV demos only")
+            target = args.output or args.demo.with_name(args.demo.stem + ".source-test.dem")
+            ranges = [(round(start * info["tick_rate"]), round(end * info["tick_rate"])) for start, end in map(parse_time_range, args.range)]
+            write_source_experiment(
+                info,
+                normalize_ranges(ranges, info["ticks"], ordered=True),
+                target,
+            )
             print(target)
         elif args.command == "split":
             output = args.output_dir or args.demo.with_name(args.demo.stem + "_parts")
