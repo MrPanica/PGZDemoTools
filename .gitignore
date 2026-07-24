@@ -1,4 +1,12 @@
 .build/
+build/
+build-linux/
+dist/
+dist-linux/
 helper/target/
 __pycache__/
 *.tmp
+*.dem
+_pov_warmup_probe.py
+pov_probe_output.txt
+voice-index-check/

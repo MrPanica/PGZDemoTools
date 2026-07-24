@@ -5,8 +5,8 @@ use std::fs;
 use std::io::Write;
 use tf_demo_parser::demo::data::DemoTick;
 use tf_demo_parser::demo::gamevent::GameEvent;
-use tf_demo_parser::demo::message::Message;
 use tf_demo_parser::demo::message::usermessage::{ChatMessageKind, HudTextLocation, UserMessage};
+use tf_demo_parser::demo::message::Message;
 use tf_demo_parser::demo::packet::stringtable::StringTableEntry;
 use tf_demo_parser::demo::parser::MessageHandler;
 use tf_demo_parser::{Demo, DemoParser, MessageType, ParserState};
@@ -90,9 +90,13 @@ impl Collector {
         if detail.is_empty() || placeholder_chat(&actor, &detail) {
             return;
         }
-        if self.events.iter().rev().take_while(|event| event.tick == tick).any(|event| {
-            event.kind == "chat" && event.actor == actor && event.detail == detail
-        }) {
+        if self
+            .events
+            .iter()
+            .rev()
+            .take_while(|event| event.tick == tick)
+            .any(|event| event.kind == "chat" && event.actor == actor && event.detail == detail)
+        {
             return;
         }
         self.events.push(DemoEvent {
@@ -167,7 +171,9 @@ impl MessageHandler for Collector {
                 GameEvent::PartyChat(event) => {
                     self.push_chat(tick, event.steam_id.to_string(), event.text.to_string())
                 }
-                GameEvent::HLTVChat(event) => self.push_chat(tick, "HLTV".into(), event.text.to_string()),
+                GameEvent::HLTVChat(event) => {
+                    self.push_chat(tick, "HLTV".into(), event.text.to_string())
+                }
                 GameEvent::PlayerSpawn(event) => {
                     let class = match event.class {
                         1 => "Scout",
@@ -339,7 +345,10 @@ fn main() -> Result<(), MainError> {
     for (client_id, packets) in &result.packets {
         let mut frames_file = fs::File::create(format!("{}/{}.txt", frames_dir, client_id))?;
         for (tick, raw) in packets {
-            let hex = raw.iter().map(|byte| format!("{:02x}", byte)).collect::<String>();
+            let hex = raw
+                .iter()
+                .map(|byte| format!("{:02x}", byte))
+                .collect::<String>();
             writeln!(frames_file, "{}|{}", tick, hex)?;
         }
     }

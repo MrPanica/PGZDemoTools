@@ -150,17 +150,35 @@ def normalize_ranges(ranges, ticks, ordered=False):
 
 def write_edit(info, ranges, target: Path, free_camera=False):
     ranges = normalize_ranges(ranges, info["ticks"], ordered=True)
+    if info["kind"] == "POV":
+        return write_pov_edit(info, ranges, target, free_camera)
     body = info["body"]
+    def selected(record, start, end, is_last):
+        # TF2 writes a final packet/usercmd exactly at playback_ticks.  Keeping
+        # it prevents a valid POV demo from ending with an incomplete state.
+        return start <= record[3] < end or (is_last and record[3] == end)
+
     first_start = ranges[0][0]
-    initial_warmup = [r for r in body if r[2] == CMD_PACKET and r[3] < first_start]
+    is_pov = info["kind"] == "POV"
+    initial_warmup = [
+        r
+        for r in body
+        if r[3] < first_start
+        and (r[2] == CMD_PACKET or is_pov and r[2] in (CMD_SYNCTICK, CMD_STRINGTABLES))
+    ]
+    if is_pov and first_start and not any(r[2] == CMD_STRINGTABLES for r in initial_warmup):
+        raise ValueError("POV demo has no initial string-table snapshot; safe clipping is unavailable")
     selected_packets = [
-        r for start, end in ranges for r in body if r[2] == CMD_PACKET and start <= r[3] < end
+        r
+        for index, (start, end) in enumerate(ranges)
+        for r in body
+        if r[2] == CMD_PACKET and selected(r, start, end, index == len(ranges) - 1)
     ]
     if not selected_packets:
         raise ValueError("selection contains no demo packets")
     output_ticks = sum(end - start for start, end in ranges)
     startup = info["data"][HEADER_SIZE : info["signon_end"]]
-    warmup_size = sum(r[1] - r[0] for r in initial_warmup)
+    warmup_size = sum(r[1] - r[0] for r in initial_warmup if r[2] == CMD_PACKET)
     header = bytearray(info["data"][:HEADER_SIZE])
     struct.pack_into(
         "<fiii",
@@ -169,7 +187,7 @@ def write_edit(info, ranges, target: Path, free_camera=False):
         output_ticks / info["tick_rate"],
         output_ticks,
         len(selected_packets),
-        len(startup) + warmup_size,
+        len(startup) if is_pov else len(startup) + warmup_size,
     )
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_suffix(target.suffix + ".tmp")
@@ -178,21 +196,35 @@ def write_edit(info, ranges, target: Path, free_camera=False):
             output.write(header)
             output.write(startup)
             for record in initial_warmup:
-                output.write(rewritten_record(info, record, command=CMD_SIGNON))
+                output.write(
+                    rewritten_record(
+                        info,
+                        record,
+                        command=CMD_SIGNON if record[2] == CMD_PACKET else None,
+                    )
+                )
             output.write(struct.pack("<Bi", CMD_SYNCTICK, 0))
             cursor, previous_end = 0, None
-            for start, end in ranges:
+            for index, (start, end) in enumerate(ranges):
                 if previous_end is not None:
                     for record in body:
-                        if record[2] == CMD_PACKET and previous_end <= record[3] < start:
+                        if (
+                            record[2] in (CMD_PACKET, CMD_STRINGTABLES)
+                            and previous_end <= record[3] < start
+                        ):
                             output.write(
-                                rewritten_record(info, record, command=CMD_SIGNON, tick=cursor)
+                                rewritten_record(
+                                    info,
+                                    record,
+                                    command=CMD_SIGNON if record[2] == CMD_PACKET else None,
+                                    tick=cursor,
+                                )
                             )
                 for record in body:
                     if (
                         record[2] != CMD_SYNCTICK
                         and (not free_camera or record[2] != CMD_USER)
-                        and start <= record[3] < end
+                        and selected(record, start, end, index == len(ranges) - 1)
                     ):
                         output.write(
                             rewritten_record(info, record, tick=cursor + record[3] - start)
@@ -292,7 +324,7 @@ def verify_edit(path: Path, expected_ticks: int, expected_frames: int):
         or not info["body"]
         or info["body"][0][2] != CMD_SYNCTICK
         or len(normal_packets) != expected_frames
-        or any(tick < 0 or tick >= expected_ticks for *_rest, tick in normal_packets)
+        or any(tick < 0 or tick > expected_ticks for *_rest, tick in normal_packets)
     ):
         raise ValueError(f"verification failed for {path}")
 
@@ -326,17 +358,92 @@ def safe_name(value: str, fallback="output") -> str:
     return value[:100] or fallback
 
 
-def voice_helper() -> Path:
-    executable = "voice_extract.exe" if os.name == "nt" else "voice_extract"
+def helper_binary(name: str) -> Path:
+    executable = f"{name}.exe" if os.name == "nt" else name
     candidates = [
         Path(__file__).parent / "helper" / "target" / "release" / executable,
-        Path(__file__).parent / ".build" / "voice_extract" / "release" / executable,
+        Path(__file__).parent / ".build" / name / "release" / executable,
         Path(__file__).with_name(executable),
     ]
     for path in candidates:
         if path.is_file():
             return path
-    raise ValueError("voice_extract is missing; run `python demo_tools.py build-helper`")
+    raise ValueError(f"{name} is missing; run `python demo_tools.py build-helper`")
+
+
+def voice_helper() -> Path:
+    return helper_binary("voice_extract")
+
+
+def join_pov_fragments(paths, target: Path):
+    """Join independently checkpointed POV fragments without a second sign-on."""
+    infos = [read_demo(path) for path in paths]
+    first = infos[0]
+    ticks = sum(info["ticks"] for info in infos)
+    frames = sum(record[2] == CMD_PACKET for info in infos for record in info["body"])
+    header = bytearray(first["data"][:HEADER_SIZE])
+    startup = first["data"][HEADER_SIZE : first["signon_end"]]
+    struct.pack_into(
+        "<fiii", header, PLAYBACK_OFFSET, ticks / first["tick_rate"], ticks, frames, len(startup)
+    )
+    temporary = target.with_suffix(target.suffix + ".tmp")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with temporary.open("wb") as output:
+            output.write(header)
+            output.write(startup)
+            cursor = 0
+            for index, info in enumerate(infos):
+                for record in info["body"]:
+                    if record[2] == CMD_STOP or index and record[2] == CMD_SYNCTICK:
+                        continue
+                    output.write(rewritten_record(info, record, tick=cursor + record[3]))
+                cursor += info["ticks"]
+            output.write(struct.pack("<Bi", CMD_STOP, ticks))
+        os.replace(temporary, target)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    verify_edit(target, ticks, frames)
+    return target
+
+
+def write_pov_edit(info, ranges, target: Path, free_camera=False):
+    if len(ranges) > 1:
+        with tempfile.TemporaryDirectory(prefix="pov_montage_") as workspace:
+            fragments = []
+            for index, current in enumerate(ranges):
+                fragment = Path(workspace) / f"{index}.dem"
+                write_pov_edit(info, [current], fragment, free_camera)
+                fragments.append(fragment)
+            return join_pov_fragments(fragments, target)
+    start, end = ranges[0]
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(target.suffix + ".tmp")
+    command = [str(helper_binary("pov_cut"))]
+    if free_camera:
+        command.append("--free-camera")
+    command.extend((str(info["path"]), str(temporary), str(start), str(end)))
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=900,
+        )
+        if result.returncode:
+            detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+            raise ValueError(f"pov_cut failed: {detail}")
+        edited = read_demo(temporary)
+        if not edited["complete_stop"] or not end - start <= edited["ticks"] <= end - start + 64:
+            raise ValueError("pov_cut produced an invalid demo")
+        os.replace(temporary, target)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return target
 
 
 def extract_demo_index(demo: Path, output: Path):
@@ -570,7 +677,7 @@ body{background:var(--bg);font-size:14px;letter-spacing:0}.shell{width:min(1180p
 .flag{display:inline-block;width:18px;height:12px;flex:0 0 18px;overflow:hidden;border:1px solid #0003;border-radius:2px;box-shadow:0 0 0 1px #fff1}.flag-ru{background:linear-gradient(to bottom,#fff 0 33.33%,#1d57a6 33.33% 66.66%,#d32932 66.66%)}.flag-en{background:#012169;background-image:linear-gradient(33deg,transparent 42%,#fff 43% 48%,#c8102e 49% 53%,#fff 54% 58%,transparent 59%),linear-gradient(-33deg,transparent 42%,#fff 43% 48%,#c8102e 49% 53%,#fff 54% 58%,transparent 59%),linear-gradient(to bottom,transparent 36%,#fff 36% 64%,transparent 64%),linear-gradient(to right,transparent 40%,#fff 40% 60%,transparent 60%),linear-gradient(to bottom,transparent 43%,#c8102e 43% 57%,transparent 57%),linear-gradient(to right,transparent 44%,#c8102e 44% 56%,transparent 56%)}.output-timeline{margin-bottom:24px;padding-bottom:30px}.output-clip.dragging{opacity:.45}.player-tabs{display:flex;gap:2px;padding:2px;border:1px solid var(--line);border-radius:7px;background:var(--panel2)}.player-tabs button{padding:4px 6px;border-radius:5px;background:transparent;color:var(--muted);font-size:11px;white-space:nowrap}.player-tabs button[aria-selected=true]{background:var(--panel);color:var(--ink);box-shadow:var(--shadow)}
 </style></head>
 <body><main class="shell">
-<header class="top"><div class="brand"><i></i>TF2 DEMO TOOLS</div><div class="top-actions"><div id="languageMenu" class="language-menu"><button id="languageButton" class="language-button" type="button" aria-haspopup="menu" aria-expanded="false"><span id="languageFlag" class="flag flag-ru" aria-hidden="true"></span><span id="languageLabel">Русский</span><svg aria-hidden="true" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"/></svg></button><div id="languageOptions" class="language-options" role="menu"><button type="button" value="system" role="menuitemradio"><span id="systemFlag" class="flag flag-ru" aria-hidden="true"></span><span data-t="systemLanguage">Язык системы</span></button><button type="button" value="ru" role="menuitemradio"><span class="flag flag-ru" aria-hidden="true"></span><span>Русский</span></button><button type="button" value="en" role="menuitemradio"><span class="flag flag-en" aria-hidden="true"></span><span>English</span></button></div></div><div id="theme" class="choice" role="group" aria-label="Тема"><button type="button" value="system" data-t-title="systemTheme" title="Тема системы">◐</button><button type="button" value="light" data-t-title="lightTheme" title="Светлая">☀</button><button type="button" value="dark" data-t-title="darkTheme" title="Тёмная">☾</button></div><button id="reset" class="ghost hidden" data-t="otherDemo">Другая демка</button></div></header>
+<header class="top"><div class="brand"><i></i>TF2 DEMO TOOLS</div><div class="top-actions"><div id="languageMenu" class="language-menu"><button id="languageButton" class="language-button" type="button" aria-haspopup="menu" aria-expanded="false"><span id="languageFlag" class="flag flag-ru" aria-hidden="true"></span><span id="languageLabel">Русский</span><svg aria-hidden="true" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"/></svg></button><div id="languageOptions" class="language-options" role="menu"><button type="button" value="system" role="menuitemradio"><span id="systemFlag" class="flag flag-ru" aria-hidden="true"></span><span data-t="systemLanguage">Язык системы</span></button><button type="button" value="ru" role="menuitemradio"><span class="flag flag-ru" aria-hidden="true"></span><span>Русский</span></button><button type="button" value="en" role="menuitemradio"><span class="flag flag-en" aria-hidden="true"></span><span>English</span></button></div></div><div id="themeMenu" class="theme-menu"><button id="themeButton" class="theme-button" type="button" aria-haspopup="menu" aria-expanded="false" aria-label="Тема" title="Тема системы"><span id="themeIcon" aria-hidden="true">◐</span></button><div id="theme" class="theme-options" role="menu" aria-label="Тема"><button type="button" value="system" role="menuitemradio" data-t-title="systemTheme" title="Тема системы" aria-label="Тема системы"><span aria-hidden="true">◐</span></button><button type="button" value="light" role="menuitemradio" data-t-title="lightTheme" title="Светлая" aria-label="Светлая"><span aria-hidden="true">☀</span></button><button type="button" value="dark" role="menuitemradio" data-t-title="darkTheme" title="Тёмная" aria-label="Тёмная"><span aria-hidden="true">☾</span></button></div></div><button id="reset" class="ghost hidden" data-t="otherDemo">Другая демка</button></div></header>
 <section id="intro"><div class="hero"><div class="eyebrow" data-t="eyebrow">Локальный редактор</div><h1 id="heroTitle">Монтаж TF2-демок<br>без лишних шагов.</h1><p data-t="heroText">POV и SourceTV, события, точная шкала тиков, монтаж отрезков и голоса игроков. Файл обрабатывается локально.</p></div>
 <div id="drop" class="drop" tabindex="0"><strong data-t="dropTitle">Перетащите сюда .dem</strong><span data-t="dropText">или выберите файл с диска</span><br><button id="pick" class="primary" data-t="pickDemo">Выбрать демку</button><input id="file" type="file" accept=".dem" hidden></div></section>
 <div id="status" class="status" role="status" aria-live="polite"></div>
@@ -592,10 +699,10 @@ const tr=(key,values={})=>Object.entries(values).reduce((text,[name,value])=>tex
 const locale=()=>language==='ru'?'ru-RU':'en-US';
 const fmt=s=>{const hundredths=Math.round(Math.max(0,s)*100),m=Math.floor(hundredths/6000),x=hundredths-m*6000;return `${m}:${(x/100).toFixed(2).padStart(5,'0')}`};
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const choiceValue=id=>$('#'+id).querySelector('button[aria-pressed=true]')?.value||'system';
-function setChoice(id,value){$('#'+id).querySelectorAll('button').forEach(button=>button.setAttribute('aria-pressed',button.value===value))}
-function applyLanguage(value){languageSetting=value;const systemLanguage=navigator.language.toLowerCase().startsWith('ru')?'ru':'en';language=value==='system'?systemLanguage:value;const flagClass=code=>'flag flag-'+code;document.documentElement.lang=language;document.querySelectorAll('[data-t]').forEach(el=>el.textContent=tr(el.dataset.t));document.querySelectorAll('[data-t-title]').forEach(el=>el.title=tr(el.dataset.tTitle));document.querySelectorAll('[data-t-placeholder]').forEach(el=>el.placeholder=tr(el.dataset.tPlaceholder));$('#heroTitle').innerHTML=tr('heroTitle');$('#languageFlag').className=flagClass(value==='system'?systemLanguage:value);$('#systemFlag').className=flagClass(systemLanguage);$('#languageLabel').textContent=value==='system'?tr('systemLanguage'):value==='ru'?'Русский':'English';$('#languageOptions').querySelectorAll('button[value]').forEach(button=>button.setAttribute('aria-checked',button.value===value));localStorage.setItem('demoToolsLanguage',value);$('#theme').ariaLabel=tr('themeLabel');if(state.meta){render();renderSegments();renderPlayers();renderLegend();renderChat();draw();say(tr('ready'))}updateAudioNote()}
-function applyTheme(value){if(value==='system')document.documentElement.removeAttribute('data-theme');else document.documentElement.dataset.theme=value;setChoice('theme',value);localStorage.setItem('demoToolsTheme',value);if(state.meta)draw()}
+const choiceValue=id=>$('#'+id).querySelector('button[aria-checked=true]')?.value||'system';
+function setChoice(id,value){$('#'+id).querySelectorAll('button').forEach(button=>button.setAttribute('aria-checked',button.value===value))}
+function applyLanguage(value){languageSetting=value;const systemLanguage=navigator.language.toLowerCase().startsWith('ru')?'ru':'en';language=value==='system'?systemLanguage:value;const flagClass=code=>'flag flag-'+code;document.documentElement.lang=language;document.querySelectorAll('[data-t]').forEach(el=>el.textContent=tr(el.dataset.t));document.querySelectorAll('[data-t-title]').forEach(el=>{el.title=tr(el.dataset.tTitle);el.ariaLabel=el.title});document.querySelectorAll('[data-t-placeholder]').forEach(el=>el.placeholder=tr(el.dataset.tPlaceholder));$('#heroTitle').innerHTML=tr('heroTitle');$('#languageFlag').className=flagClass(value==='system'?systemLanguage:value);$('#systemFlag').className=flagClass(systemLanguage);$('#languageLabel').textContent=value==='system'?tr('systemLanguage'):value==='ru'?'Русский':'English';$('#languageOptions').querySelectorAll('button[value]').forEach(button=>button.setAttribute('aria-checked',button.value===value));localStorage.setItem('demoToolsLanguage',value);$('#theme').ariaLabel=tr('themeLabel');$('#themeButton').ariaLabel=tr('themeLabel');const themeValue=choiceValue('theme');$('#themeButton').title=tr(themeValue==='light'?'lightTheme':themeValue==='dark'?'darkTheme':'systemTheme');if(state.meta){render();renderSegments();renderPlayers();renderLegend();renderChat();draw();say(tr('ready'))}updateAudioNote()}
+function applyTheme(value){if(value==='system')document.documentElement.removeAttribute('data-theme');else document.documentElement.dataset.theme=value;setChoice('theme',value);$('#themeIcon').textContent=value==='light'?'☀':value==='dark'?'☾':'◐';$('#themeButton').title=tr(value==='light'?'lightTheme':value==='dark'?'darkTheme':'systemTheme');localStorage.setItem('demoToolsTheme',value);if(state.meta)draw()}
 function say(text,error=false){statusEl.textContent=text;statusEl.className='status'+(error?' error':'')}
 function filename(res){const h=res.headers.get('content-disposition')||'';const m=h.match(/filename\*=UTF-8''([^;]+)/i);return m?decodeURIComponent(m[1]):'download'}
 function downloadBlob(blob,name){const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),10000)}
@@ -630,7 +737,7 @@ let dragIndex=-1;function moveRange(from,to){if(from===to||from<0||to<0)return;c
 $('#outputTrack').addEventListener('dragstart',e=>{const clip=e.target.closest('.output-clip');if(!clip)return;dragIndex=+clip.dataset.index;clip.classList.add('dragging');e.dataTransfer.effectAllowed='move'});$('#outputTrack').addEventListener('dragend',()=>{dragIndex=-1;document.querySelectorAll('.output-clip').forEach(clip=>clip.classList.remove('dragging'))});
 let outputPointerIndex=-1;function dropOutputRange(clientX){if(outputPointerIndex<0)return;const track=$('#outputTrack'),rect=track.getBoundingClientRect(),total=state.ranges.reduce((sum,range)=>sum+range[1]-range[0],0),point=(clientX-rect.left)/rect.width*total;let sum=0,to=state.ranges.findIndex(range=>(sum+=range[1]-range[0])>=point);moveRange(outputPointerIndex,to<0?state.ranges.length:to);outputPointerIndex=-1;document.querySelectorAll('.output-clip').forEach(clip=>clip.classList.remove('dragging'))}$('#outputTrack').addEventListener('pointerdown',e=>{const clip=e.target.closest('.output-clip');if(!clip)return;e.preventDefault();outputPointerIndex=+clip.dataset.index;clip.classList.add('dragging');e.currentTarget.setPointerCapture?.(e.pointerId)});$('#outputTrack').addEventListener('pointerup',e=>dropOutputRange(e.clientX));$('#outputTrack').addEventListener('pointercancel',()=>{outputPointerIndex=-1;document.querySelectorAll('.output-clip').forEach(clip=>clip.classList.remove('dragging'))});
 $('#downloadMontage').onclick=e=>{if(!state.ranges.length)return say(tr('addFirst'),true);post('/api/edit',{id:state.id,ranges:state.ranges,freeCamera:$('#freeCamera').checked},e.currentTarget)};
-$('#toggleAll').onclick=()=>{const boxes=[...document.querySelectorAll('#players input')],on=boxes.some(input=>!input.checked);boxes.forEach(input=>input.checked=on)};$('#playerSearch').oninput=e=>{const q=e.target.value.trim().toLowerCase();document.querySelectorAll('#players .player').forEach(row=>row.hidden=!row.textContent.toLowerCase().includes(q))};$('#downloadVoices').onclick=e=>downloadVoices(e.currentTarget);$('#downloadAllVoices').onclick=e=>{const clients=state.players.map(player=>player.client);if(clients.length)post('/api/voice',{id:state.id,clients,keepGaps:$('#keepGaps').checked},e.currentTarget)};$('#audioFormat').onchange=updateAudioNote;$('#freeCamera').onchange=renderPov;$('#languageButton').onclick=()=>{const menu=$('#languageMenu'),open=!menu.classList.contains('open');menu.classList.toggle('open',open);$('#languageButton').setAttribute('aria-expanded',open)};$('#languageOptions').onclick=e=>{const button=e.target.closest('button[value]');if(!button)return;applyLanguage(button.value);$('#languageMenu').classList.remove('open');$('#languageButton').setAttribute('aria-expanded','false')};document.addEventListener('click',e=>{if(!e.target.closest('#languageMenu')){$('#languageMenu').classList.remove('open');$('#languageButton').setAttribute('aria-expanded','false')}});$('#theme').onclick=e=>{const button=e.target.closest('button[value]');if(button)applyTheme(button.value)};window.addEventListener('languagechange',()=>{languageSetting==='system'&&applyLanguage('system')});matchMedia('(prefers-color-scheme: dark)').addEventListener('change',()=>{choiceValue('theme')==='system'&&state.meta&&draw()});applyTheme(localStorage.getItem('demoToolsTheme')||'system');applyLanguage(localStorage.getItem('demoToolsLanguage')||'system');
+$('#toggleAll').onclick=()=>{const boxes=[...document.querySelectorAll('#players input')],on=boxes.some(input=>!input.checked);boxes.forEach(input=>input.checked=on)};$('#playerSearch').oninput=e=>{const q=e.target.value.trim().toLowerCase();document.querySelectorAll('#players .player').forEach(row=>row.hidden=!row.textContent.toLowerCase().includes(q))};$('#downloadVoices').onclick=e=>downloadVoices(e.currentTarget);$('#downloadAllVoices').onclick=e=>{const clients=state.players.map(player=>player.client);if(clients.length)post('/api/voice',{id:state.id,clients,keepGaps:$('#keepGaps').checked},e.currentTarget)};$('#audioFormat').onchange=updateAudioNote;$('#freeCamera').onchange=renderPov;$('#languageButton').onclick=()=>{const menu=$('#languageMenu'),open=!menu.classList.contains('open');menu.classList.toggle('open',open);$('#languageButton').setAttribute('aria-expanded',open);$('#themeMenu').classList.remove('open');$('#themeButton').setAttribute('aria-expanded','false')};$('#languageOptions').onclick=e=>{const button=e.target.closest('button[value]');if(!button)return;applyLanguage(button.value);$('#languageMenu').classList.remove('open');$('#languageButton').setAttribute('aria-expanded','false')};$('#themeButton').onclick=()=>{const menu=$('#themeMenu'),open=!menu.classList.contains('open');menu.classList.toggle('open',open);$('#themeButton').setAttribute('aria-expanded',open);$('#languageMenu').classList.remove('open');$('#languageButton').setAttribute('aria-expanded','false')};$('#theme').onclick=e=>{const button=e.target.closest('button[value]');if(!button)return;applyTheme(button.value);$('#themeMenu').classList.remove('open');$('#themeButton').setAttribute('aria-expanded','false')};document.addEventListener('click',e=>{if(!e.target.closest('#languageMenu')){$('#languageMenu').classList.remove('open');$('#languageButton').setAttribute('aria-expanded','false')}if(!e.target.closest('#themeMenu')){$('#themeMenu').classList.remove('open');$('#themeButton').setAttribute('aria-expanded','false')}});window.addEventListener('languagechange',()=>{languageSetting==='system'&&applyLanguage('system')});matchMedia('(prefers-color-scheme: dark)').addEventListener('change',()=>{choiceValue('theme')==='system'&&state.meta&&draw()});applyTheme(localStorage.getItem('demoToolsTheme')||'system');applyLanguage(localStorage.getItem('demoToolsLanguage')||'system');
 async function restoreSession(){let saved;try{const shared=new URLSearchParams(location.search).get('session');saved=shared?{id:shared}:JSON.parse(localStorage.getItem('tf2DemoToolsSession')||'null')}catch(_){localStorage.removeItem('tf2DemoToolsSession');return}if(!saved?.id)return;try{const r=await fetch('/api/session?id='+saved.id),data=await r.json();if(!r.ok)throw new Error(data.error);state={id:data.id,meta:data.meta,ranges:Array.isArray(saved.ranges)?saved.ranges:[],players:[],allPlayers:[],playerTab:'voices',events:[],eventsLoaded:false,hit:[],selectionReady:true};render();$('#startRange').value=saved.selection?.[0]??0;$('#endRange').value=saved.selection?.[1]??data.meta.ticks;syncSelection();renderSegments();intro.classList.add('hidden');workspace.classList.remove('hidden');$('#reset').classList.remove('hidden');say(tr('ready'));loadVoices()}catch(_){localStorage.removeItem('tf2DemoToolsSession')}}restoreSession();
 </script></body></html>'''
 
@@ -638,6 +745,7 @@ HTML = HTML.replace(
     "</head>",
     """<style>
 .players-card .panel-head{display:grid;gap:8px;margin-bottom:10px}.players-card .player-tabs{min-width:0;width:100%}.players-card #toggleAll{justify-self:start;padding:5px 9px;white-space:nowrap}.output-clip{flex:0 0 var(--clip-width);width:var(--clip-width);transition:transform .12s ease,box-shadow .12s ease,opacity .12s ease}.output-clip.dragging{opacity:.35;transform:scale(.985)}.output-clip.drop-target{box-shadow:inset 0 0 0 2px #fffd}
+.theme-menu{position:relative}.theme-button,.theme-options{padding:4px;border:1px solid var(--line);border-radius:10px;background:var(--panel)}.theme-button{display:grid;width:46px;height:44px;place-items:center;color:var(--accent2);font-size:16px}.theme-button:hover,.theme-button[aria-expanded=true]{border-color:var(--line-strong)}.theme-button>span{display:grid;width:36px;height:34px;place-items:center;border-radius:7px;background:var(--accent-soft)}.theme-options{position:absolute;top:calc(100% + 6px);right:0;z-index:12;display:none;gap:3px}.theme-menu.open .theme-options{display:grid}.theme-options button{display:grid;width:36px;height:34px;place-items:center;border-radius:7px;background:transparent;color:var(--muted);font-size:16px}.theme-options button:hover,.theme-options button[aria-checked=true]{background:var(--accent-soft);color:var(--accent2)}
 </style></head>""",
 )
 HTML = HTML.replace(
@@ -653,8 +761,8 @@ $('#outputTrack').addEventListener('pointermove',event=>{if(outputPointerIndex<0
 $('#outputTrack').addEventListener('pointerup',clearOutputDropTargets);$('#outputTrack').addEventListener('pointercancel',clearOutputDropTargets);
 $('#outputTrack').addEventListener('dragover',event=>{if(dragIndex<0)return;clearOutputDropTargets();const target=event.target.closest('.output-clip');if(target&&+target.dataset.index!==dragIndex)target.classList.add('drop-target')});
 $('#outputTrack').addEventListener('dragend',clearOutputDropTargets);
-document.head.insertAdjacentHTML('beforeend',`<style>.player-tabs button[value=all]{order:-1}.player .name a,.event-player{color:inherit;text-decoration:none}.player .name a:hover,.event-player:hover{text-decoration:underline}.team-red{color:#df726a!important}.team-blu{color:#6d9bd0!important}.team-spectator{color:var(--muted)!important}.chat-row{cursor:pointer}.chat-row:hover{background:var(--panel)}.track.event-focus{outline:2px solid var(--accent);outline-offset:2px}.event-tip{background:var(--panel)!important;opacity:1}.language-options{left:0;right:auto}.flag{border:1px solid #0003!important;box-shadow:none!important}.flag::after{content:none!important}.flag-ru{background:linear-gradient(#fff 0 33.333%,#1d57a6 33.333% 66.666%)!important}.flag-en{background:#012169 url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 60 30'%3E%3Cpath fill='%23012169' d='M0 0h60v30H0z'/%3E%3Cpath stroke='%23fff' stroke-width='6' d='m0 0 60 30m0-30L0 30'/%3E%3Cpath stroke='%23c8102e' stroke-width='2' d='m0 0 60 30m0-30L0 30'/%3E%3Cpath stroke='%23fff' stroke-width='10' d='M30 0v30M0 15h60'/%3E%3Cpath stroke='%23c8102e' stroke-width='6' d='M30 0v30M0 15h60'/%3E%3C/svg%3E") center/cover no-repeat!important}</style>`);
-document.head.insertAdjacentHTML('beforeend',`<style>#track.tip-open{z-index:8;overflow:visible}.event-tip{z-index:9999!important}.selection{z-index:1!important;left:0!important;right:0!important;border:0!important;box-shadow:none!important;background:linear-gradient(to right,#0005 0 var(--start),transparent var(--start) var(--end),#0005 var(--end) 100%)!important}#chatRows .chat-row[hidden]{display:none!important}.montage-inline .actions{display:flex;gap:8px;align-items:center}.montage-name{flex:1;min-width:180px}.event-legend button{display:inline-flex;align-items:center;gap:6px;padding:3px 6px;border:1px solid transparent;border-radius:5px;background:transparent;color:inherit;font:inherit;cursor:pointer}.event-legend button[aria-pressed=false]{opacity:.38;text-decoration:line-through}.flag-ru{background:linear-gradient(to bottom,#fff 0 33.333%,#0039a6 33.333% 66.666%,#d52b1e 66.666% 100%)!important}</style>`);
+document.head.insertAdjacentHTML('beforeend',`<style>.player-tabs button[value=all]{order:-1}.player .name a,.event-player{color:inherit;text-decoration:none}.player .name a:hover,.event-player:hover{text-decoration:underline}.team-red{color:#df726a!important}.team-blu{color:#6d9bd0!important}.team-spectator{color:var(--muted)!important}.chat-row{cursor:pointer}.chat-row:hover{background:var(--panel)}.track.event-focus{outline:2px solid var(--accent);outline-offset:2px}.event-tip{background:var(--panel)!important;opacity:1}#languageOptions{left:0;right:auto}.flag{border:1px solid #0003!important;box-shadow:none!important}.flag::after{content:none!important}.flag-ru{background:linear-gradient(#fff 0 33.333%,#1d57a6 33.333% 66.666%)!important}.flag-en{background:#012169 url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 60 30'%3E%3Cpath fill='%23012169' d='M0 0h60v30H0z'/%3E%3Cpath stroke='%23fff' stroke-width='6' d='m0 0 60 30m0-30L0 30'/%3E%3Cpath stroke='%23c8102e' stroke-width='2' d='m0 0 60 30m0-30L0 30'/%3E%3Cpath stroke='%23fff' stroke-width='10' d='M30 0v30M0 15h60'/%3E%3Cpath stroke='%23c8102e' stroke-width='6' d='M30 0v30M0 15h60'/%3E%3C/svg%3E") center/cover no-repeat!important}</style>`);
+document.head.insertAdjacentHTML('beforeend',`<style>#track.tip-open{z-index:8;overflow:visible}.event-tip{z-index:9999!important}.selection{z-index:1!important;left:0!important;right:0!important;border:0!important;box-shadow:none!important;background:linear-gradient(to right,#0005 0 var(--start),transparent var(--start) var(--end),#0005 var(--end) 100%)!important}#chatRows .chat-row[hidden]{display:none!important}.montage-inline .actions{display:flex;gap:8px;align-items:center}.montage-name{flex:1;min-width:180px}.event-legend button{display:inline-flex;align-items:center;gap:6px;padding:3px 6px;border:1px solid transparent;border-radius:5px;background:transparent;color:inherit;font:inherit;cursor:pointer}.event-legend button[aria-pressed=false]{opacity:.38;text-decoration:line-through}.flag-ru{background:linear-gradient(to bottom,#fff 0 33.333%,#0039a6 33.333% 66.666%,#d52b1e 66.666% 100%)!important}.pov-free-camera{cursor:pointer;font:inherit}.pov-free-camera[aria-pressed=true]{background:var(--accent);border-color:var(--accent);color:#fff}</style>`);
 const montageName=document.createElement('input');montageName.id='montageName';montageName.className='control montage-name';montageName.type='text';montageName.maxLength=100;montageName.spellcheck=false;montageName.setAttribute('aria-label','Demo filename');$('#downloadMontage').before(montageName);
 I18N.ru.eventsHistory='События · {count}';I18N.en.eventsHistory='Events · {count}';
 const steamProfile=name=>{const player=[...state.allPlayers,...state.players].find(player=>player.name===name),match=player?.steamid?.match(/U:1:(\\d+)/);return match?'https://steamcommunity.com/profiles/'+(76561197960265728n+BigInt(match[1])).toString():''};
@@ -674,6 +782,13 @@ const rawRenderSegments=renderSegments;
 renderSegments=()=>{rawRenderSegments();const ticks=state.ranges.reduce((sum,range)=>sum+range[1]-range[0],0)||1,points=[0];state.ranges.reduce((sum,range)=>(points.push(sum+range[1]-range[0]),sum+range[1]-range[0]),0);$('#outputTimeAxis').innerHTML=points.map((value,index)=>`<span style="left:${value/ticks*100}%;transform:translateX(${index===0?'0':index===points.length-1?'-100%':'-50%'})">${fmt(value/state.meta.tickRate)}</span>`).join('')};
 const rawRender=render;
 render=()=>{rawRender();if(state.meta)montageName.value=state.meta.name.replace(/\\.dem$/i,'')+(state.meta.kind==='POV'&&$('#freeCamera').checked?'-freecam':'-edit')};
+I18N.ru.freeCameraTooltip='При скачивании монтажа убирает POV-команды и позволяет свободно управлять камерой. POV другого игрока не создаётся.';
+I18N.en.freeCameraTooltip='When downloading the montage, removes POV commands for free camera control. It does not create a POV for another player.';
+const renderWithPovFreeCameraButton=render;
+const renderPovFreeCameraButton=()=>{const current=$('#povFreeCameraButton'),pov=state.meta?.kind==='POV';if(!pov){current?.remove();return}const button=current||document.createElement('button'),enabled=$('#freeCamera').checked;button.id='povFreeCameraButton';button.type='button';button.className='badge pov-free-camera';button.textContent=tr('freeCamera');button.title=tr('freeCameraTooltip');button.setAttribute('aria-pressed',String(enabled));if(!current){button.onclick=()=>$('#freeCamera').click();$('#badges').append(button)}};
+render=()=>{renderWithPovFreeCameraButton();renderPovFreeCameraButton()};
+$('#freeCamera').addEventListener('change',renderPovFreeCameraButton);
+$('#freeCamera').addEventListener('change',()=>{if(state.meta)montageName.value=state.meta.name.replace(/\\.dem$/i,'')+($('#freeCamera').checked?'-freecam':'-edit')});
 const rawShowEventTip=showEventTip;
 showEventTip=(...args)=>{$('#track').classList.add('tip-open');rawShowEventTip(...args)};
 $('#track').addEventListener('mouseleave',()=>$('#track').classList.remove('tip-open'));
@@ -775,7 +890,7 @@ class DemoHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/voice":
                 return self.send_voices(session_id, session, payload)
             self.fail("not found", 404)
-        except (OSError, ValueError, KeyError, json.JSONDecodeError, subprocess.SubprocessError) as error:
+        except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError, subprocess.SubprocessError) as error:
             self.fail(error)
 
     def upload(self, query):
@@ -949,15 +1064,18 @@ def main():
     cut.add_argument("--to", dest="end", type=float, required=True)
     cut.add_argument("--free-camera", action="store_true", help="omit POV user commands")
     cut.add_argument("-o", "--output", type=Path)
-    montage = commands.add_parser("montage", help="join several time ranges from one demo")
+    montage = commands.add_parser(
+        "montage", help="join ordered time ranges from one POV/SourceTV demo"
+    )
     montage.add_argument("demo", type=Path)
-    montage.add_argument("--range", action="append", required=True, help="START:END seconds; repeatable")
+    montage.add_argument(
+        "--range",
+        action="append",
+        required=True,
+        help="START:END seconds; repeat in output order",
+    )
     montage.add_argument("--free-camera", action="store_true", help="omit POV user commands")
     montage.add_argument("-o", "--output", type=Path)
-    join = commands.add_parser("join", help="join consecutive compatible SourceTV demos")
-    join.add_argument("demos", nargs="+", type=Path)
-    join.add_argument("-r", "--range", action="append", type=parse_time_range, help="START:END seconds; repeat for every demo")
-    join.add_argument("-o", "--output", type=Path, required=True)
     split = commands.add_parser("split", help="split into independent parts")
     split.add_argument("demo", type=Path)
     group = split.add_mutually_exclusive_group()
@@ -972,7 +1090,7 @@ def main():
     voice.add_argument("--format", choices=("ogg", "wav", "mp3"), default="ogg")
     voice.add_argument("--archive", action="store_true", help="also create voices.zip")
     voice.add_argument("-o", "--output-dir", type=Path)
-    commands.add_parser("build-helper", help="build the cross-platform Rust voice helper")
+    commands.add_parser("build-helper", help="build the Rust POV and voice helpers")
     commands.add_parser("self-test", help="run the built-in check")
     args = parser.parse_args()
     try:
@@ -1001,8 +1119,6 @@ def main():
             ranges = [(round(start * info["tick_rate"]), round(end * info["tick_rate"])) for start, end in map(parse_time_range, args.range)]
             write_edit(info, ranges, target, free_camera=args.free_camera)
             print(target)
-        elif args.command == "join":
-            print(write_join(args.demos, args.output, args.range))
         elif args.command == "split":
             output = args.output_dir or args.demo.with_name(args.demo.stem + "_parts")
             targets = split_demo(args.demo, output, args.parts, args.seconds)
@@ -1021,8 +1137,10 @@ def main():
             print(f"Created {len(targets)} voice tracks in {output}")
         elif args.command == "build-helper":
             helper = Path(__file__).parent / "helper"
-            subprocess.run(["cargo", "build", "--release"], cwd=helper, check=True)
+            if helper.is_dir():
+                subprocess.run(["cargo", "build", "--release"], cwd=helper, check=True)
             print(voice_helper())
+            print(helper_binary("pov_cut"))
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         parser.error(str(error))
 

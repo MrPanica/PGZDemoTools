@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 tf-demo-parser = { path = "tf_parser" }
 main_error = "0.1"
+bitbuffer = "0.11"
 
 [[bin]]
 name = "voice_extract"

@@ -1,5 +1,6 @@
 services:
   pgz-demo-tools:
+    image: demotools-pgz-demo-tools:latest
     build: .
     ports:
       - "127.0.0.1:8765:8765"
