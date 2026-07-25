@@ -1,4 +1,4 @@
-use bitbuffer::{BitRead, BitWrite, BitWriteStream, LittleEndian};
+use bitbuffer::{BitRead, BitReadBuffer, BitReadStream, BitWrite, BitWriteStream, LittleEndian};
 use main_error::MainError;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
@@ -8,11 +8,11 @@ use tf_demo_parser::demo::header::Header;
 use tf_demo_parser::demo::message::packetentities::{
     BaselineIndex, EntityId, PacketEntitiesMessage, PacketEntity, UpdateType,
 };
-use tf_demo_parser::demo::message::Message;
+use tf_demo_parser::demo::message::{Message, MessageType};
 use tf_demo_parser::demo::packet::synctick::SyncTickPacket;
 use tf_demo_parser::demo::packet::usercmd::UserCmd;
 use tf_demo_parser::demo::packet::{Packet, PacketType};
-use tf_demo_parser::demo::parser::{DemoHandler, Encode, RawPacketStream};
+use tf_demo_parser::demo::parser::{DemoHandler, Encode, Parse, RawPacketStream};
 use tf_demo_parser::Demo;
 
 struct HistoryPacket<'a> {
@@ -127,7 +127,10 @@ fn observe_entities(
         }
         snapshots.insert(tick, entities.clone());
         while snapshots.len() > 128 {
-            let oldest = *snapshots.keys().next().expect("snapshot cache is not empty");
+            let oldest = *snapshots
+                .keys()
+                .next()
+                .expect("snapshot cache is not empty");
             snapshots.remove(&oldest);
         }
         result = Some(entities);
@@ -161,6 +164,7 @@ fn replace_entity_snapshot(
     current: &EntitySnapshot,
     previous: &mut Option<EntitySnapshot>,
     previous_tick: Option<ServerTick>,
+    current_tick: Option<ServerTick>,
 ) -> bool {
     let (Packet::Message(packet) | Packet::Signon(packet)) = packet else {
         return false;
@@ -191,7 +195,11 @@ fn replace_entity_snapshot(
             .iter()
             .copied()
             .collect::<BTreeSet<_>>();
-        let full_reset = previous.is_none() || previous_tick.is_none();
+        // TF2 rejects a PacketEntities delta that names its own server tick.
+        // A second network update can legitimately arrive on the same tick;
+        // write that one as a complete snapshot instead.
+        let full_reset =
+            previous.is_none() || previous_tick.is_none() || previous_tick == current_tick;
         let mut entities = Vec::new();
         for current_entity in current.values().filter(|entity| entity.in_pvs) {
             let mut entity;
@@ -213,7 +221,9 @@ fn replace_entity_snapshot(
                                 forced_props.is_some_and(|props| props.contains(&prop.identifier))
                                     || old
                                         .props
-                                        .binary_search_by_key(&prop.index, |old_prop| old_prop.index)
+                                        .binary_search_by_key(&prop.index, |old_prop| {
+                                            old_prop.index
+                                        })
                                         .map_or(true, |index| old.props[index] != **prop)
                             })
                             .cloned()
@@ -244,23 +254,23 @@ fn replace_entity_snapshot(
         }
         if !full_reset {
             if let Some(old) = previous.as_ref() {
-            entities.extend(
-                old.iter()
-                    .filter(|(entity, _)| {
-                        !source_removed.contains(entity)
-                            && current.get(entity).is_none_or(|entity| !entity.in_pvs)
-                    })
-                    .map(|(id, entity)| {
-                        let mut entity = (**entity).clone();
-                        entity.update_type = source_updates
-                            .get(id)
-                            .map_or(UpdateType::Leave, |(update_type, _)| *update_type);
-                        entity.props.clear();
-                        entity.delta = previous_tick;
-                        entity
-                    }),
-            );
-            entities.sort_by_key(|entity| entity.entity_index);
+                entities.extend(
+                    old.iter()
+                        .filter(|(entity, _)| {
+                            !source_removed.contains(entity)
+                                && current.get(entity).is_none_or(|entity| !entity.in_pvs)
+                        })
+                        .map(|(id, entity)| {
+                            let mut entity = (**entity).clone();
+                            entity.update_type = source_updates
+                                .get(id)
+                                .map_or(UpdateType::Leave, |(update_type, _)| *update_type);
+                            entity.props.clear();
+                            entity.delta = previous_tick;
+                            entity
+                        }),
+                );
+                entities.sort_by_key(|entity| entity.entity_index);
             }
         }
         let snapshot = previous.get_or_insert_with(BTreeMap::new);
@@ -284,11 +294,15 @@ fn replace_entity_snapshot(
             } else {
                 source_removed
                     .into_iter()
-                    .filter(|entity| previous.as_ref().is_some_and(|old| old.contains_key(entity)))
+                    .filter(|entity| {
+                        previous
+                            .as_ref()
+                            .is_some_and(|old| old.contains_key(entity))
+                    })
                     .collect()
             },
             max_entries: update.max_entries,
-            delta: previous_tick,
+            delta: if full_reset { None } else { previous_tick },
             base_line: if full_reset {
                 BaselineIndex::First
             } else {
@@ -312,6 +326,31 @@ fn encode_packet(
         packet.encode(&mut stream, &handler.state_handler)?;
     }
     output.extend_from_slice(&encoded);
+    Ok(())
+}
+
+fn validate_demo(input: &[u8]) -> Result<(), MainError> {
+    let demo = Demo::new(input);
+    let mut stream = demo.get_stream();
+    let header = Header::read(&mut stream)?;
+    let mut handler = DemoHandler::default();
+    handler.handle_header(&header);
+    let mut packet_number = 0usize;
+    loop {
+        let packet_start = stream.pos();
+        let command = input[packet_start / 8];
+        let packet = Packet::parse(&mut stream, &handler.state_handler).map_err(|error| {
+            format!(
+                "generated demo packet {packet_number} command {command} at bit {packet_start}: {error}"
+            )
+        })?;
+        packet_number += 1;
+        let stop = matches!(packet, Packet::Stop(_));
+        handler.handle_packet(packet)?;
+        if stop {
+            break;
+        }
+    }
     Ok(())
 }
 
@@ -360,10 +399,41 @@ mod tests {
         let mut second = Packet::Message(Default::default());
         continue_packet_sequence(&mut first, &mut next);
         continue_packet_sequence(&mut second, &mut next);
-        let Packet::Message(first) = first else { unreachable!() };
-        let Packet::Message(second) = second else { unreachable!() };
-        assert_eq!((first.meta.sequence_in, first.meta.sequence_out), (20_805, 20_805));
-        assert_eq!((second.meta.sequence_in, second.meta.sequence_out), (20_806, 20_806));
+        let Packet::Message(first) = first else {
+            unreachable!()
+        };
+        let Packet::Message(second) = second else {
+            unreachable!()
+        };
+        assert_eq!(
+            (first.meta.sequence_in, first.meta.sequence_out),
+            (20_805, 20_805)
+        );
+        assert_eq!(
+            (second.meta.sequence_in, second.meta.sequence_out),
+            (20_806, 20_806)
+        );
+    }
+
+    #[test]
+    fn raw_signon_history_continues_the_packet_sequence() {
+        let mut raw = vec![0; 89];
+        let mut next = 42;
+        rewrite_raw_sequence(&mut raw, &mut next);
+        assert_eq!(u32::from_le_bytes(raw[81..85].try_into().unwrap()), 42);
+        assert_eq!(u32::from_le_bytes(raw[85..89].try_into().unwrap()), 42);
+        assert_eq!(next, 43);
+    }
+
+    #[test]
+    fn raw_tick_rewrite_keeps_unaligned_bits_intact() {
+        let mut bytes = vec![0b1010_0101; 6];
+        write_le_bits(&mut bytes, 3, 0x1234_5678).unwrap();
+        let value = (0..32).fold(0u32, |value, bit| {
+            value | (u32::from((bytes[(3 + bit) / 8] >> ((3 + bit) % 8)) & 1) << bit)
+        });
+        assert_eq!(value, 0x1234_5678);
+        assert_eq!(bytes[0] & 0b111, 0b101);
     }
 }
 
@@ -496,6 +566,7 @@ fn cut_source_montage(
                     &entities,
                     &mut previous_output_entities,
                     previous_output_tick,
+                    Some(output_tick.into()),
                 ) {
                     previous_output_tick = Some(output_tick.into());
                 }
@@ -524,7 +595,8 @@ fn cut_source_montage(
     header.signon += extra_signon.len() as u32;
 
     let signon = &input[header_bytes..signon_end_bytes];
-    let mut output = Vec::with_capacity(header_bytes + signon.len() + extra_signon.len() + body.len());
+    let mut output =
+        Vec::with_capacity(header_bytes + signon.len() + extra_signon.len() + body.len());
     {
         let mut output_stream = BitWriteStream::new(&mut output, LittleEndian);
         header.write(&mut output_stream)?;
@@ -533,14 +605,17 @@ fn cut_source_montage(
     output.extend_from_slice(&extra_signon);
     output.extend_from_slice(&body);
     fs::write(output_path, output)?;
-    eprintln!("wrote {} SourceTV frames across {} ranges", frames, ranges.len());
+    eprintln!(
+        "wrote {} SourceTV frames across {} ranges",
+        frames,
+        ranges.len()
+    );
     Ok(())
 }
 
 // SourceTV packets contain message types that this parser intentionally skips.
-// Re-encoding a whole stream therefore drops state and makes the engine
-// disconnect. This mode keeps the selected packets raw and injects one normal
-// full PacketEntities checkpoint before each range.
+// Keep them raw and replay each range's original history at its boundary so
+// PacketEntities deltas retain the frames they reference.
 fn append_raw_packet(
     input: &[u8],
     output: &mut Vec<u8>,
@@ -548,18 +623,114 @@ fn append_raw_packet(
     source_end: usize,
     tick: u32,
     kind: PacketType,
+    state: &tf_demo_parser::ParserState,
+    server_tick_map: Option<(u32, u32)>,
     next_sequence: &mut u32,
     frames: &mut u32,
-) {
+) -> Result<(), MainError> {
     let mut raw = input[source_start..source_end].to_vec();
     raw[1..5].copy_from_slice(&tick.to_le_bytes());
     if matches!(kind, PacketType::Message) {
-        raw[81..85].copy_from_slice(&next_sequence.to_le_bytes());
-        raw[85..89].copy_from_slice(&next_sequence.to_le_bytes());
-        *next_sequence = next_sequence.wrapping_add(1);
+        if let Some((source_origin, output_origin)) = server_tick_map {
+            rewrite_raw_server_ticks(&mut raw, state, source_origin, output_origin)?;
+        }
+        rewrite_raw_sequence(&mut raw, next_sequence);
         *frames = frames.saturating_add(1);
     }
     output.extend_from_slice(&raw);
+    Ok(())
+}
+
+fn rewrite_raw_sequence(raw: &mut [u8], next_sequence: &mut u32) {
+    raw[81..85].copy_from_slice(&next_sequence.to_le_bytes());
+    raw[85..89].copy_from_slice(&next_sequence.to_le_bytes());
+    *next_sequence = next_sequence.wrapping_add(1);
+}
+
+// A raw Message packet starts with its command/tick/meta (93 bytes), followed
+// by a bit stream. Keep that stream intact, but retime the two server-tick
+// references that make a PacketEntities delta chain continuous across cuts.
+fn rewrite_raw_server_ticks(
+    raw: &mut [u8],
+    state: &tf_demo_parser::ParserState,
+    source_origin: u32,
+    output_origin: u32,
+) -> Result<(), MainError> {
+    const MESSAGE_DATA_OFFSET: usize = 93;
+    if raw.len() < MESSAGE_DATA_OFFSET {
+        return Err("raw message packet is too short".into());
+    }
+    let length = u32::from_le_bytes(raw[89..93].try_into()?) as usize;
+    let end = MESSAGE_DATA_OFFSET
+        .checked_add(length)
+        .ok_or("raw message packet length overflows")?;
+    if end > raw.len() {
+        return Err("raw message packet data is truncated".into());
+    }
+
+    let mut stream = BitReadStream::new(BitReadBuffer::new(
+        &raw[MESSAGE_DATA_OFFSET..end],
+        LittleEndian,
+    ));
+    let mut replacements = Vec::new();
+    while stream.bits_left() > 6 {
+        let message_type = MessageType::read(&mut stream)?;
+        let payload_start = stream.pos();
+        match message_type {
+            MessageType::NetTick => {
+                let tick: ServerTick = stream.read()?;
+                replacements.push((
+                    payload_start,
+                    map_server_tick(u32::from(tick), source_origin, output_origin),
+                ));
+                stream.read::<u16>()?;
+                stream.read::<u16>()?;
+            }
+            MessageType::PacketEntities => {
+                stream.read_sized::<u16>(11)?;
+                let has_delta: bool = stream.read()?;
+                if has_delta {
+                    let delta_start = stream.pos();
+                    let delta: ServerTick = stream.read()?;
+                    replacements.push((
+                        delta_start,
+                        map_server_tick(u32::from(delta), source_origin, output_origin),
+                    ));
+                }
+                stream.set_pos(payload_start)?;
+                Message::skip_type(message_type, &mut stream, state)?;
+            }
+            _ => Message::skip_type(message_type, &mut stream, state)?,
+        }
+    }
+    drop(stream);
+    for (bit_offset, value) in replacements {
+        write_le_bits(&mut raw[MESSAGE_DATA_OFFSET..end], bit_offset, value)?;
+    }
+    Ok(())
+}
+
+fn map_server_tick(source: u32, source_origin: u32, output_origin: u32) -> u32 {
+    (i64::from(output_origin) + i64::from(source) - i64::from(source_origin)) as u32
+}
+
+fn write_le_bits(bytes: &mut [u8], bit_offset: usize, value: u32) -> Result<(), MainError> {
+    if bit_offset
+        .checked_add(32)
+        .is_none_or(|end| end > bytes.len() * 8)
+    {
+        return Err("raw message tick field is truncated".into());
+    }
+    for bit in 0..32 {
+        let index = bit_offset + bit;
+        let mask = 1u8 << (index % 8);
+        if value & (1 << bit) == 0 {
+            bytes[index / 8] &= !mask;
+        } else {
+            bytes[index / 8] |= mask;
+        }
+    }
+    Ok(())
 }
 
 fn cut_source_raw_replay(
@@ -580,9 +751,7 @@ fn cut_source_raw_replay(
     let header_bytes = stream.pos() / 8;
     let mut packets = RawPacketStream::new(stream);
     let mut source = DemoHandler::default();
-    let mut output_handler = DemoHandler::default();
     source.handle_header(&header);
-    output_handler.handle_header(&header);
     let mut body_start = None;
     let mut last_signon_sequence = 0u32;
 
@@ -599,8 +768,7 @@ fn cut_source_raw_replay(
             if matches!(packet, Packet::Message(_)) {
                 body_start = Some(start);
             } else {
-                source.handle_packet(packet.clone())?;
-                output_handler.handle_packet(packet)?;
+                source.handle_packet(packet)?;
                 continue;
             }
         }
@@ -613,6 +781,8 @@ fn cut_source_raw_replay(
     let mut next_sequence = last_signon_sequence.wrapping_add(1);
     let mut cursor = 0u32;
     let mut frames = 0u32;
+    let mut timeline_server_origin = None;
+    let mut next_server_tick = None;
 
     for (range_index, (start, end)) in ranges.iter().copied().enumerate() {
         let demo = Demo::new(input);
@@ -622,14 +792,11 @@ fn cut_source_raw_replay(
         let mut range_packets = RawPacketStream::new(range_stream);
         let mut range_source = DemoHandler::default();
         range_source.handle_header(&range_header);
-        let mut snapshots = BTreeMap::new();
-        // The original sign-on establishes the entity baseline at tick zero.
-        // Do not inject a reconstructed snapshot before its first raw packet.
-        // A synthetic PacketEntities checkpoint is incomplete for SourceTV.
-        // Bootstrap a non-zero first range with the original raw history as
-        // sign-on instead; later ranges still need a checkpoint transition.
-        let bootstrap_history = range_index == 0 && start > 0;
-        let mut checkpoint_written = start == 0 || bootstrap_history;
+        // Replay a range's history before its selected packets. This keeps the
+        // exact SourceTV delta cache without rebuilding entity messages.
+        let bootstrap_history = start > 0;
+        let mut range_server_origin = None;
+        let mut range_output_origin = None;
 
         loop {
             let raw_start = range_packets.pos() / 8;
@@ -638,7 +805,6 @@ fn cut_source_raw_replay(
             };
             let raw_end = range_packets.pos() / 8;
             if range_packets.pos() <= range_signon_end {
-                observe_entities(&packet, &range_source.state_handler, &mut snapshots)?;
                 range_source.handle_packet(packet)?;
                 continue;
             }
@@ -647,55 +813,71 @@ fn cut_source_raw_replay(
             if tick >= end || matches!(packet, Packet::Stop(_)) {
                 break;
             }
-            observe_entities(&packet, &range_source.state_handler, &mut snapshots)?;
+            let packet_server_tick = match &packet {
+                Packet::Message(message) | Packet::Signon(message) => {
+                    message.messages.iter().find_map(|message| {
+                        if let Message::NetTick(message) = message {
+                            Some(u32::from(message.tick))
+                        } else {
+                            None
+                        }
+                    })
+                }
+                _ => None,
+            };
             if tick < start {
-                if bootstrap_history && matches!(packet.packet_type(), PacketType::Message) {
+                if range_index == 0
+                    && bootstrap_history
+                    && matches!(packet.packet_type(), PacketType::Message)
+                {
                     let mut raw = input[raw_start..raw_end].to_vec();
                     raw[0] = PacketType::Signon as u8;
+                    rewrite_raw_sequence(&mut raw, &mut next_sequence);
                     extra_signon.extend_from_slice(&raw);
+                } else if bootstrap_history && matches!(packet.packet_type(), PacketType::Message) {
+                    if let Some(server_tick) = packet_server_tick {
+                        let source_origin = *range_server_origin.get_or_insert(server_tick);
+                        let output_origin = *range_output_origin
+                            .get_or_insert(next_server_tick.unwrap_or(server_tick));
+                        let mapped = map_server_tick(server_tick, source_origin, output_origin);
+                        append_raw_packet(
+                            input,
+                            &mut body,
+                            raw_start,
+                            raw_end,
+                            cursor,
+                            PacketType::Message,
+                            &range_source.state_handler,
+                            Some((source_origin, output_origin)),
+                            &mut next_sequence,
+                            &mut frames,
+                        )?;
+                        next_server_tick = Some(
+                            next_server_tick
+                                .unwrap_or(mapped)
+                                .max(mapped)
+                                .wrapping_add(1),
+                        );
+                    }
                 }
                 range_source.handle_packet(packet)?;
                 continue;
             }
-
-            if !checkpoint_written {
-                let Packet::Message(message) = &packet else {
-                    range_source.handle_packet(packet)?;
-                    continue;
-                };
-                let Some(entity_update) = message.messages.iter().find_map(|message| match message {
-                    Message::PacketEntities(update) => Some(update),
-                    _ => None,
-                }) else {
-                    range_source.handle_packet(packet)?;
-                    continue;
-                };
-                let base_tick = entity_update.delta.ok_or("source checkpoint has no entity base")?;
-                let base = snapshots
-                    .get(&u32::from(base_tick))
-                    .cloned()
-                    .ok_or("source checkpoint entity base is unavailable")?;
-                let mut checkpoint = packet.clone();
-                if let Packet::Message(message) = &mut checkpoint {
-                    message.messages.retain(|message| {
-                        matches!(message, Message::NetTick(_) | Message::PacketEntities(_))
-                    });
-                }
-                checkpoint.set_tick(cursor.into());
-                set_server_tick(&mut checkpoint, base_tick);
-                let mut no_previous = None;
-                if !replace_entity_snapshot(&mut checkpoint, &base, &mut no_previous, None) {
-                    return Err("source checkpoint has no packet entities".into());
-                }
-                let mut checkpoint_sequence = Some(next_sequence);
-                continue_packet_sequence(&mut checkpoint, &mut checkpoint_sequence);
-                if let Packet::Message(message) = &checkpoint {
-                    next_sequence = message.meta.sequence_in.wrapping_add(1);
-                    frames = frames.saturating_add(1);
-                }
-                encode_packet(&checkpoint, &mut body, &output_handler)?;
-                checkpoint_written = true;
+            if let Some(server_tick) = packet_server_tick {
+                let timeline_tick = *timeline_server_origin.get_or_insert(server_tick);
+                let source_origin = *range_server_origin.get_or_insert(server_tick);
+                let output_origin = *range_output_origin.get_or_insert(
+                    next_server_tick.unwrap_or(timeline_tick.saturating_add(cursor)),
+                );
+                let mapped = map_server_tick(server_tick, source_origin, output_origin);
+                next_server_tick = Some(
+                    next_server_tick
+                        .unwrap_or(mapped)
+                        .max(mapped)
+                        .wrapping_add(1),
+                );
             }
+            let server_tick_map = range_server_origin.zip(range_output_origin);
 
             let kind = packet.packet_type();
             append_raw_packet(
@@ -705,13 +887,12 @@ fn cut_source_raw_replay(
                 raw_end,
                 cursor + tick - start,
                 kind,
+                &range_source.state_handler,
+                server_tick_map,
                 &mut next_sequence,
                 &mut frames,
-            );
+            )?;
             range_source.handle_packet(packet)?;
-        }
-        if !checkpoint_written {
-            return Err("source range has no packet-entity checkpoint".into());
         }
         cursor = cursor.saturating_add(end - start);
     }
@@ -719,21 +900,32 @@ fn cut_source_raw_replay(
     body.extend_from_slice(&cursor.to_le_bytes());
 
     let tick_rate = header.ticks as f32 / header.duration;
+    let signon_end = header_bytes + header.signon as usize;
     let mut output_header = header;
     output_header.duration = cursor as f32 / tick_rate;
     output_header.ticks = cursor;
     output_header.frames = frames;
-    output_header.signon = output_header.signon.saturating_add(extra_signon.len() as u32);
+    output_header.signon = output_header
+        .signon
+        .saturating_add(extra_signon.len() as u32);
     let mut output = Vec::with_capacity(header_bytes + extra_signon.len() + body.len());
     {
         let mut stream = BitWriteStream::new(&mut output, LittleEndian);
         output_header.write(&mut stream)?;
     }
-    output.extend_from_slice(&input[header_bytes..body_start]);
+    // `header.signon` ends before the first sync tick.  The bootstrap packets
+    // belong in that sign-on span, otherwise the header boundary lands inside
+    // a packet and TF2 sees an early dem_stop.
+    output.extend_from_slice(&input[header_bytes..signon_end]);
     output.extend_from_slice(&extra_signon);
+    output.extend_from_slice(&input[signon_end..body_start]);
     output.extend_from_slice(&body);
+    validate_demo(&output)?;
     fs::write(output_path, output)?;
-    eprintln!("wrote {frames} raw SourceTV frames across {} ranges", ranges.len());
+    eprintln!(
+        "wrote {frames} raw SourceTV frames across {} ranges",
+        ranges.len()
+    );
     Ok(())
 }
 
@@ -760,7 +952,9 @@ fn main() -> Result<(), MainError> {
         return cut_source_montage(&fs::read(&args[0])?, &args[1], &ranges);
     }
     if !(4..=5).contains(&args.len()) {
-        eprintln!("usage: pov_cut <input.dem> <output.dem> <start-tick> <end-tick> [server-tick-offset]");
+        eprintln!(
+            "usage: pov_cut <input.dem> <output.dem> <start-tick> <end-tick> [server-tick-offset]"
+        );
         std::process::exit(2);
     }
     let input = fs::read(&args[0])?;
@@ -848,6 +1042,7 @@ fn main() -> Result<(), MainError> {
                         snapshot,
                         &mut previous_output_entities,
                         previous_output_tick,
+                        Some(server_tick),
                     ) {
                         return Err("invalid packet-entity warmup".into());
                     }
@@ -899,6 +1094,7 @@ fn main() -> Result<(), MainError> {
                     &entities,
                     &mut previous_output_entities,
                     previous_output_tick,
+                    Some(server_tick),
                 ) {
                     previous_output_tick = Some(server_tick);
                 }
