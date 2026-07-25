@@ -172,7 +172,7 @@ def write_source_web(
     info,
     ranges,
     target: Path,
-    normalize_packet_sequences=False,
+    normalize_packet_sequences=True,
     bridge_as_packets=False,
     bridge_ticks=0,
     replay_full_history=False,
@@ -226,12 +226,38 @@ def write_source_web(
     target.parent.mkdir(parents=True, exist_ok=True)
     try:
         with temporary.open("wb") as output:
+            startup_packets = [
+                record
+                for record in info["records"]
+                if record[1] <= info["signon_end"]
+                and record[2] in (CMD_SIGNON, CMD_PACKET)
+            ]
+            next_sequence = (
+                (struct.unpack_from("<I", info["data"], startup_packets[-1][0] + 81)[0] + 1)
+                & 0xFFFFFFFF
+                if normalize_packet_sequences and startup_packets
+                else None
+            )
+
+            def write_record(record, command=None, tick=None):
+                nonlocal next_sequence
+                rewritten = rewritten_record(info, record, command=command, tick=tick)
+                # Packet metadata is still read after a dem_packet is repackaged
+                # as dem_signon. Keep one monotonic stream through warmup, bridges
+                # and selected ranges; otherwise a reverse range jumps backwards.
+                if normalize_packet_sequences and record[2] == CMD_PACKET:
+                    if next_sequence is None:
+                        next_sequence = struct.unpack_from("<I", rewritten, 81)[0]
+                    struct.pack_into("<II", rewritten, 81, next_sequence, next_sequence)
+                    next_sequence = (next_sequence + 1) & 0xFFFFFFFF
+                output.write(rewritten)
+
             output.write(header)
             output.write(startup)
             for record in initial_warmup:
-                output.write(rewritten_record(info, record, command=CMD_SIGNON))
+                write_record(record, command=CMD_SIGNON)
             output.write(struct.pack("<Bi", CMD_SYNCTICK, 0))
-            cursor, previous_end, next_sequence = 0, None, None
+            cursor, previous_end = 0, None
             for index, (start, end) in enumerate(ranges):
                 if previous_end is not None:
                     bridge = bridge_records(previous_end, start)
@@ -247,25 +273,12 @@ def write_source_web(
                         if bridge_as_packets:
                             tick = bridge_tick(cursor, packet_index, len(packets), bridge_ticks)
                             packet_index += 1
-                        output.write(
-                            rewritten_record(
-                                info,
-                                record,
-                                command=command,
-                                tick=tick,
-                            )
-                        )
+                        write_record(record, command=command, tick=tick)
                     if bridge_as_packets and bridge:
                         cursor += bridge_ticks
                 for record in body:
                     if record[2] != CMD_SYNCTICK and selected(record, start, end, index == len(ranges) - 1):
-                        rewritten = rewritten_record(info, record, tick=cursor + record[3] - start)
-                        if normalize_packet_sequences and record[2] == CMD_PACKET:
-                            if next_sequence is None:
-                                next_sequence = struct.unpack_from("<I", rewritten, 81)[0]
-                            struct.pack_into("<II", rewritten, 81, next_sequence, next_sequence)
-                            next_sequence = (next_sequence + 1) & 0xFFFFFFFF
-                        output.write(rewritten)
+                        write_record(record, tick=cursor + record[3] - start)
                 cursor += end - start
                 previous_end = end
             output.write(struct.pack("<Bi", CMD_STOP, output_ticks))

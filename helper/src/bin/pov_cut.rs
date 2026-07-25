@@ -13,6 +13,7 @@ use tf_demo_parser::demo::packet::synctick::SyncTickPacket;
 use tf_demo_parser::demo::packet::usercmd::UserCmd;
 use tf_demo_parser::demo::packet::{Packet, PacketType};
 use tf_demo_parser::demo::parser::{DemoHandler, Encode, Parse, RawPacketStream};
+use tf_demo_parser::demo::sendprop::SendPropValue;
 use tf_demo_parser::Demo;
 
 struct HistoryPacket<'a> {
@@ -23,6 +24,24 @@ struct HistoryPacket<'a> {
 }
 
 type EntitySnapshot = BTreeMap<EntityId, Arc<PacketEntity>>;
+
+fn clamp_network_strings(value: &mut SendPropValue) {
+    match value {
+        SendPropValue::String(text) if text.len() > 511 => {
+            let mut end = 511;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.truncate(end);
+        }
+        SendPropValue::Array(values) => {
+            for value in values {
+                clamp_network_strings(value);
+            }
+        }
+        _ => {}
+    }
+}
 
 fn merge_user_cmd(state: &mut Option<UserCmd>, update: &UserCmd) {
     let Some(current) = state.as_mut() else {
@@ -249,7 +268,14 @@ fn replace_entity_snapshot(
                 entity.update_type = UpdateType::Enter;
             }
             entity.in_pvs = true;
-            entity.delta = previous_tick;
+            for prop in &mut entity.props {
+                clamp_network_strings(&mut prop.value);
+            }
+            // An entering entity in a complete snapshot has no preceding
+            // PacketEntities baseline. Keeping the source delta here makes
+            // TF2 decode the property stream against a snapshot that is not
+            // present in the edited demo.
+            entity.delta = if full_reset { None } else { previous_tick };
             entities.push(entity);
         }
         if !full_reset {
@@ -315,16 +341,145 @@ fn replace_entity_snapshot(
     false
 }
 
-fn encode_packet(
+const MAX_PACKET_ENTITY_BITS: usize = (1 << 20) - 256;
+
+fn packet_entity_bits(
+    update: &PacketEntitiesMessage,
+    state: &tf_demo_parser::ParserState,
+) -> Result<usize, MainError> {
+    let mut bytes = Vec::new();
+    let mut stream = BitWriteStream::new(&mut bytes, LittleEndian);
+    update.encode(&mut stream, state)?;
+    Ok(stream.bit_len())
+}
+
+fn split_full_snapshot(
+    current: &EntitySnapshot,
+    max_entries: u16,
+    baseline: BaselineIndex,
+    state: &tf_demo_parser::ParserState,
+) -> Result<Vec<Vec<PacketEntity>>, MainError> {
+    let mut chunks = Vec::new();
+    let mut chunk = Vec::new();
+    // The following raw delta may Preserve an entity that is currently outside
+    // the SourceTV PVS.  It still has to exist in the boundary snapshot.
+    for entity in current.values() {
+        let mut entity = (**entity).clone();
+        entity.update_type = UpdateType::Enter;
+        entity.delta = None;
+        entity.baseline_index = baseline;
+        for prop in &mut entity.props {
+            clamp_network_strings(&mut prop.value);
+        }
+        chunk.push(entity);
+        let probe = PacketEntitiesMessage {
+            entities: chunk.clone(),
+            removed_entities: Vec::new(),
+            max_entries,
+            delta: None,
+            base_line: baseline,
+            updated_base_line: false,
+        };
+        if packet_entity_bits(&probe, state)? > MAX_PACKET_ENTITY_BITS {
+            let entity = chunk.pop().expect("just pushed an entity");
+            if chunk.is_empty() {
+                return Err("one entity exceeds the PacketEntities size limit".into());
+            }
+            chunks.push(std::mem::take(&mut chunk));
+            chunk.push(entity);
+        }
+    }
+    if !chunk.is_empty() {
+        chunks.push(chunk);
+    }
+    Ok(chunks)
+}
+
+fn checkpoint_packets<'a>(
+    packet: &Packet<'a>,
+    chunks: Vec<Vec<PacketEntity>>,
+    output_start_tick: u32,
+    server_start_tick: u32,
+    max_entries: u16,
+    baseline: BaselineIndex,
+) -> Result<Vec<Packet<'a>>, MainError> {
+    let Packet::Message(template) = packet else {
+        return Err("PacketEntities checkpoint is not a Message packet".into());
+    };
+    let count = chunks.len();
+    let first_baseline = if count % 2 == 0 {
+        baseline
+    } else {
+        baseline.other()
+    };
+    let mut packets = Vec::with_capacity(count);
+    for (index, entities) in chunks.into_iter().enumerate() {
+        let output_tick = output_start_tick + index as u32;
+        let server_tick = server_start_tick + index as u32;
+        let base_line = if index % 2 == 0 {
+            first_baseline
+        } else {
+            first_baseline.other()
+        };
+        let mut message = template.clone();
+        message.tick = output_tick.into();
+        message
+            .messages
+            .retain(|message| matches!(message, Message::NetTick(_)));
+        for net_tick in &mut message.messages {
+            if let Message::NetTick(net_tick) = net_tick {
+                net_tick.tick = server_tick.into();
+            }
+        }
+        message
+            .messages
+            .push(Message::PacketEntities(PacketEntitiesMessage {
+                entities,
+                removed_entities: Vec::new(),
+                max_entries,
+                delta: (index > 0).then(|| (server_tick - 1).into()),
+                base_line,
+                updated_base_line: true,
+            }));
+        packets.push(Packet::Message(message));
+    }
+    Ok(packets)
+}
+
+fn without_packet_entities(packet: &mut Packet<'_>) {
+    if let Packet::Message(message) | Packet::Signon(message) = packet {
+        message
+            .messages
+            .retain(|message| !matches!(message, Message::PacketEntities(_)));
+    }
+}
+
+fn encode_packet_bytes(
     packet: &Packet<'_>,
-    output: &mut Vec<u8>,
     handler: &DemoHandler<'_, tf_demo_parser::demo::parser::handler::NullHandler>,
-) -> Result<(), MainError> {
+) -> Result<Vec<u8>, MainError> {
     let mut encoded = Vec::new();
     {
         let mut stream = BitWriteStream::new(&mut encoded, LittleEndian);
         packet.encode(&mut stream, &handler.state_handler)?;
     }
+    let mut verify = BitReadStream::new(BitReadBuffer::new(&encoded, LittleEndian));
+    Packet::parse(&mut verify, &handler.state_handler).map_err(|error| {
+        format!(
+            "cannot re-parse {:?} at tick {}: {error}",
+            packet.packet_type(),
+            u32::from(packet.tick())
+        )
+    })?;
+    Ok(encoded)
+}
+
+fn encode_packet(
+    packet: &Packet<'_>,
+    output: &mut Vec<u8>,
+    handler: &DemoHandler<'_, tf_demo_parser::demo::parser::handler::NullHandler>,
+) -> Result<(), MainError> {
+    let encoded = encode_packet_bytes(packet, handler)?;
     output.extend_from_slice(&encoded);
     Ok(())
 }
@@ -460,7 +615,6 @@ fn cut_source_montage(
     }
 
     let tick_rate = header.ticks as f32 / header.duration;
-    let total_ticks = ranges.iter().map(|(start, end)| end - start).sum::<u32>();
     let mut output_handler = DemoHandler::default();
     output_handler.handle_header(&header);
     let mut body = Vec::new();
@@ -474,7 +628,6 @@ fn cut_source_montage(
     let mut frames = 0u32;
     let mut output_signon_written = false;
     let mut next_output_sequence = None;
-    let mut extra_signon = Vec::new();
     // The output remains one continuous netchannel.  Keeping this snapshot
     // across ranges makes the first packet of the next range a real delta
     // from the final state of the previous range instead of a second sign-on.
@@ -494,14 +647,13 @@ fn cut_source_montage(
         let mut source_snapshots = BTreeMap::new();
         let mut table_updates: Vec<Packet<'_>> = Vec::new();
         let mut checkpoint_written = false;
+        let mut range_offset = 0u32;
 
         loop {
-            let before = packets.pos();
             let Some(packet) = packets.next(&source.state_handler)? else {
                 break;
             };
-            let after = packets.pos();
-            if after <= signon_end_bits {
+            if packets.pos() <= signon_end_bits {
                 if let Some(snapshot) =
                     observe_entities(&packet, &source.state_handler, &mut source_snapshots)?
                 {
@@ -528,12 +680,6 @@ fn cut_source_montage(
                 if message.messages.iter().any(|message| matches!(message, Message::PacketEntities(_))));
 
             if !selected || (!checkpoint_written && !has_entities) {
-                if !output_signon_written && packet.packet_type() == PacketType::Message {
-                    let mut raw = input[before / 8..after / 8].to_vec();
-                    raw[0] = PacketType::Signon as u8;
-                    extra_signon.extend_from_slice(&raw);
-                    output_handler.handle_packet(packet.clone())?;
-                }
                 if let Some(update) = string_table_update(&packet) {
                     table_updates.push(update);
                 }
@@ -541,6 +687,7 @@ fn cut_source_montage(
                 continue;
             }
 
+            let mut checkpoint_packet = false;
             if !checkpoint_written {
                 for mut update in table_updates.drain(..) {
                     update.set_tick(cursor.into());
@@ -552,16 +699,61 @@ fn cut_source_montage(
                     encode_packet(&update, &mut body, &output_handler)?;
                     output_handler.handle_packet(update)?;
                 }
+                let (max_entries, baseline) = match &packet {
+                    Packet::Message(message) | Packet::Signon(message) => message
+                        .messages
+                        .iter()
+                        .find_map(|message| match message {
+                            Message::PacketEntities(update) => {
+                                Some((update.max_entries, update.base_line))
+                            }
+                            _ => None,
+                        })
+                        .ok_or("missing PacketEntities checkpoint")?,
+                    _ => return Err("PacketEntities checkpoint is not a network packet".into()),
+                };
+                let checkpoint_start = cursor + range_offset;
+                let chunks = split_full_snapshot(
+                    &entities,
+                    max_entries,
+                    baseline,
+                    &output_handler.state_handler,
+                )?;
+                let checkpoint_ticks = chunks.len() as u32;
+                for mut checkpoint in
+                    checkpoint_packets(
+                        &packet,
+                        chunks,
+                        checkpoint_start,
+                        checkpoint_start,
+                        max_entries,
+                        baseline,
+                    )?
+                {
+                    continue_packet_sequence(&mut checkpoint, &mut next_output_sequence);
+                    frames += 1;
+                    encode_packet(&checkpoint, &mut body, &output_handler)?;
+                    output_handler.handle_packet(checkpoint)?;
+                }
+                if checkpoint_ticks == 0 {
+                    return Err("PacketEntities checkpoint is empty".into());
+                }
+                previous_output_entities = Some(entities.clone());
+                previous_output_tick = Some((checkpoint_start + checkpoint_ticks - 1).into());
+                range_offset += checkpoint_ticks;
                 checkpoint_written = true;
+                checkpoint_packet = true;
             }
 
             if packet.packet_type() != PacketType::SyncTick
                 && (start != 0 || packet.packet_type() != PacketType::StringTables)
             {
-                let output_tick = cursor + tick - start;
+                let output_tick = cursor + range_offset + tick - start;
                 let mut output_packet = packet.clone();
                 output_packet.set_tick(output_tick.into());
-                if replace_entity_snapshot(
+                if checkpoint_packet {
+                    without_packet_entities(&mut output_packet);
+                } else if replace_entity_snapshot(
                     &mut output_packet,
                     &entities,
                     &mut previous_output_entities,
@@ -584,26 +776,24 @@ fn cut_source_montage(
             return Err("montage range has no packet-entity checkpoint".into());
         }
         output_signon_written = true;
-        cursor += end - start;
+        cursor += end - start + range_offset;
     }
 
     body.push(PacketType::Stop as u8);
-    body.extend_from_slice(&total_ticks.to_le_bytes());
-    header.ticks = total_ticks;
-    header.duration = total_ticks as f32 / tick_rate;
+    body.extend_from_slice(&cursor.to_le_bytes());
+    header.ticks = cursor;
+    header.duration = cursor as f32 / tick_rate;
     header.frames = frames;
-    header.signon += extra_signon.len() as u32;
-
     let signon = &input[header_bytes..signon_end_bytes];
     let mut output =
-        Vec::with_capacity(header_bytes + signon.len() + extra_signon.len() + body.len());
+        Vec::with_capacity(header_bytes + signon.len() + body.len());
     {
         let mut output_stream = BitWriteStream::new(&mut output, LittleEndian);
         header.write(&mut output_stream)?;
     }
     output.extend_from_slice(signon);
-    output.extend_from_slice(&extra_signon);
     output.extend_from_slice(&body);
+    validate_demo(&output)?;
     fs::write(output_path, output)?;
     eprintln!(
         "wrote {} SourceTV frames across {} ranges",
@@ -792,11 +982,19 @@ fn cut_source_raw_replay(
         let mut range_packets = RawPacketStream::new(range_stream);
         let mut range_source = DemoHandler::default();
         range_source.handle_header(&range_header);
+        let mut source_snapshots = BTreeMap::new();
         // Replay a range's history before its selected packets. This keeps the
-        // exact SourceTV delta cache without rebuilding entity messages.
+        // exact SourceTV delta cache without rebuilding the selected packets.
         let bootstrap_history = start > 0;
         let mut range_server_origin = None;
         let mut range_output_origin = None;
+        let mut checkpoint_written = range_index == 0;
+        let mut range_offset = 0u32;
+        // Entity deltas are intentionally not replayed before a later range:
+        // that makes TF2 fast-forward the missing gameplay.  String-table
+        // updates are different; they carry model and item dictionary entries
+        // the fresh entity snapshot refers to.
+        let mut table_updates = Vec::new();
 
         loop {
             let raw_start = range_packets.pos() / 8;
@@ -805,6 +1003,7 @@ fn cut_source_raw_replay(
             };
             let raw_end = range_packets.pos() / 8;
             if range_packets.pos() <= range_signon_end {
+                observe_entities(&packet, &range_source.state_handler, &mut source_snapshots)?;
                 range_source.handle_packet(packet)?;
                 continue;
             }
@@ -834,32 +1033,113 @@ fn cut_source_raw_replay(
                     raw[0] = PacketType::Signon as u8;
                     rewrite_raw_sequence(&mut raw, &mut next_sequence);
                     extra_signon.extend_from_slice(&raw);
-                } else if bootstrap_history && matches!(packet.packet_type(), PacketType::Message) {
-                    if let Some(server_tick) = packet_server_tick {
-                        let source_origin = *range_server_origin.get_or_insert(server_tick);
-                        let output_origin = *range_output_origin
-                            .get_or_insert(next_server_tick.unwrap_or(server_tick));
-                        let mapped = map_server_tick(server_tick, source_origin, output_origin);
-                        append_raw_packet(
-                            input,
-                            &mut body,
-                            raw_start,
-                            raw_end,
-                            cursor,
-                            PacketType::Message,
-                            &range_source.state_handler,
-                            Some((source_origin, output_origin)),
-                            &mut next_sequence,
-                            &mut frames,
-                        )?;
-                        next_server_tick = Some(
-                            next_server_tick
-                                .unwrap_or(mapped)
-                                .max(mapped)
-                                .wrapping_add(1),
-                        );
+                }
+                if range_index > 0 {
+                    if let Some(update) = string_table_update(&packet) {
+                        table_updates.push(update);
                     }
                 }
+                observe_entities(&packet, &range_source.state_handler, &mut source_snapshots)?;
+                range_source.handle_packet(packet)?;
+                continue;
+            }
+            if !checkpoint_written {
+                let Packet::Message(message) = &packet else {
+                    range_source.handle_packet(packet)?;
+                    continue;
+                };
+                let update = message.messages.iter().find_map(|message| match message {
+                    Message::PacketEntities(update) => Some(update),
+                    _ => None,
+                });
+                let Some(update) = update else {
+                    range_source.handle_packet(packet)?;
+                    continue;
+                };
+                let server_tick = packet_server_tick
+                    .ok_or("SourceTV boundary PacketEntities has no server tick")?;
+                let previous = update
+                    .delta
+                    .and_then(|tick| source_snapshots.get(&u32::from(tick)).cloned());
+                // Decode the source boundary delta once, then materialize its
+                // resulting state.  Replaying that raw delta after a synthetic
+                // snapshot leaves some client entity state (notably models) in
+                // the old PVS cache.
+                let current = observe_entities(
+                    &packet,
+                    &range_source.state_handler,
+                    &mut source_snapshots,
+                )?
+                    .ok_or("SourceTV boundary has no entity snapshot")?;
+                let checkpoint_start = cursor;
+                let checkpoint_server_start = next_server_tick.unwrap_or(checkpoint_start);
+                for mut update in table_updates.drain(..) {
+                    update.set_tick(cursor.into());
+                    let mut update_sequence = Some(next_sequence);
+                    continue_packet_sequence(&mut update, &mut update_sequence);
+                    next_sequence = update_sequence.expect("string-table sequence is set");
+                    encode_packet(&update, &mut body, &range_source)?;
+                    if matches!(update.packet_type(), PacketType::Message) {
+                        frames = frames.saturating_add(1);
+                    }
+                }
+                let mut checkpoint_ticks = 0u32;
+                if let Some(previous) = previous {
+                    let chunks = split_full_snapshot(
+                        &previous,
+                        update.max_entries,
+                        update.base_line,
+                        &range_source.state_handler,
+                    )?;
+                    for mut checkpoint in checkpoint_packets(
+                        &packet,
+                        chunks,
+                        checkpoint_start,
+                        checkpoint_server_start,
+                        update.max_entries,
+                        update.base_line,
+                    )? {
+                        let mut checkpoint_sequence = Some(next_sequence);
+                        continue_packet_sequence(&mut checkpoint, &mut checkpoint_sequence);
+                        next_sequence = checkpoint_sequence.expect("checkpoint sequence is set");
+                        encode_packet(&checkpoint, &mut body, &range_source)?;
+                        frames = frames.saturating_add(1);
+                        checkpoint_ticks = checkpoint_ticks.saturating_add(1);
+                    }
+                }
+                let chunks = split_full_snapshot(
+                    &current,
+                    update.max_entries,
+                    update.base_line,
+                    &range_source.state_handler,
+                )?;
+                for mut checkpoint in checkpoint_packets(
+                    &packet,
+                    chunks,
+                    checkpoint_start + checkpoint_ticks,
+                    checkpoint_server_start + checkpoint_ticks,
+                    update.max_entries,
+                    update.base_line,
+                )? {
+                    let mut checkpoint_sequence = Some(next_sequence);
+                    continue_packet_sequence(&mut checkpoint, &mut checkpoint_sequence);
+                    next_sequence = checkpoint_sequence.expect("checkpoint sequence is set");
+                    encode_packet(&checkpoint, &mut body, &range_source)?;
+                    frames = frames.saturating_add(1);
+                    checkpoint_ticks = checkpoint_ticks.saturating_add(1);
+                }
+                if checkpoint_ticks == 0 {
+                    return Err("SourceTV boundary snapshot is empty".into());
+                }
+                let checkpoint_end = checkpoint_server_start + checkpoint_ticks - 1;
+                range_server_origin = Some(server_tick);
+                range_output_origin = Some(checkpoint_end);
+                next_server_tick = Some(checkpoint_end.wrapping_add(1));
+                range_offset = checkpoint_ticks;
+                checkpoint_written = true;
+                // The checkpoint replaces this packet's PacketEntities delta.
+                // The following raw packet now resolves its delta against the
+                // checkpoint's final server tick.
                 range_source.handle_packet(packet)?;
                 continue;
             }
@@ -885,7 +1165,7 @@ fn cut_source_raw_replay(
                 &mut body,
                 raw_start,
                 raw_end,
-                cursor + tick - start,
+                cursor + range_offset + tick - start,
                 kind,
                 &range_source.state_handler,
                 server_tick_map,
@@ -894,7 +1174,7 @@ fn cut_source_raw_replay(
             )?;
             range_source.handle_packet(packet)?;
         }
-        cursor = cursor.saturating_add(end - start);
+        cursor = cursor.saturating_add(end - start + range_offset);
     }
     body.push(PacketType::Stop as u8);
     body.extend_from_slice(&cursor.to_le_bytes());
