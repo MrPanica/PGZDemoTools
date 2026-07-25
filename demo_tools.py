@@ -191,7 +191,8 @@ def write_source_web(
         return [
             record
             for record in body
-            if record[2] == CMD_PACKET and bridge_start <= record[3] < start
+            if record[2] in (CMD_PACKET, CMD_STRINGTABLES)
+            and bridge_start <= record[3] < start
         ]
 
     first_start = ranges[0][0]
@@ -237,7 +238,11 @@ def write_source_web(
                     packets = bridge
                     packet_index = 0
                     for record in bridge:
-                        command = CMD_PACKET if bridge_as_packets else CMD_SIGNON
+                        command = (
+                            CMD_PACKET
+                            if bridge_as_packets
+                            else CMD_SIGNON if record[2] == CMD_PACKET else None
+                        )
                         tick = cursor
                         if bridge_as_packets:
                             tick = bridge_tick(cursor, packet_index, len(packets), bridge_ticks)
@@ -459,8 +464,6 @@ def join_checkpoint_fragments(paths, target: Path):
             output.write(startup)
             cursor = 0
             for index, info in enumerate(infos):
-                if index:
-                    output.write(struct.pack("<Bi", CMD_SYNCTICK, cursor))
                 for record in info["body"]:
                     if record[2] == CMD_STOP or index and record[2] == CMD_SYNCTICK:
                         continue
@@ -475,20 +478,18 @@ def join_checkpoint_fragments(paths, target: Path):
     return target
 
 
-def write_checkpoint_edit(info, ranges, target: Path, server_tick_offset=0):
+def write_checkpoint_edit(info, ranges, target: Path):
     if len(ranges) > 1:
         with temporary_directory("pov_montage_") as workspace:
             fragments = [Path(workspace) / f"{index}.dem" for index in range(len(ranges))]
-            server_tick_offset = 0
             for current, fragment in zip(ranges, fragments):
-                write_checkpoint_edit(info, [current], fragment, server_tick_offset)
-                server_tick_offset += read_demo(fragment)["ticks"]
+                write_checkpoint_edit(info, [current], fragment)
             return join_checkpoint_fragments(fragments, target)
     start, end = ranges[0]
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_suffix(target.suffix + ".tmp")
-    command = [str(helper_binary("pov_cut"))]
-    command.extend((str(info["path"]), str(temporary), str(start), str(end), str(server_tick_offset)))
+    command = [str(helper_binary("pov_cut_stable"))]
+    command.extend((str(info["path"]), str(temporary), str(start), str(end)))
     try:
         result = subprocess.run(
             command,
