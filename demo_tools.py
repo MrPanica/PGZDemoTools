@@ -142,6 +142,21 @@ def rewritten_record(info, record, command=None, tick=None) -> bytes:
     return result
 
 
+def rewrite_user_sequence(record: bytearray, sequence: int):
+    struct.pack_into("<I", record, 5, sequence)
+    size = struct.unpack_from("<I", record, 9)[0]
+    payload = int.from_bytes(record[13 : 13 + size], "little")
+    if not payload & 1:
+        raise ValueError("user command has no command number")
+    payload = (payload & ~(((1 << 32) - 1) << 1)) | (sequence << 1) | 1
+    record[13 : 13 + size] = payload.to_bytes(size, "little")
+
+
+def sequence_delta(value: int, origin: int) -> int:
+    delta = (value - origin) & 0xFFFFFFFF
+    return delta - 0x100000000 if delta & 0x80000000 else delta
+
+
 def normalize_ranges(ranges, ticks, ordered=False):
     clean = sorted((int(a), int(b)) for a, b in ranges)
     if not clean or any(a < 0 or b > ticks or a >= b for a, b in clean):
@@ -481,14 +496,27 @@ def join_checkpoint_fragments(paths, target: Path):
                 if record[1] <= first["signon_end"]
                 and record[2] in (CMD_SIGNON, CMD_PACKET)
             ]
-            next_sequence = (
-                (struct.unpack_from("<I", first["data"], startup_packets[-1][0] + 81)[0] + 1)
-                & 0xFFFFFFFF
-                if startup_packets
-                else None
-            )
+            if startup_packets:
+                startup_in, startup_out = struct.unpack_from(
+                    "<II", first["data"], startup_packets[-1][0] + 81
+                )
+                next_sequence_in = (startup_in + 1) & 0xFFFFFFFF
+                last_sequence_out = startup_out
+                next_user_sequence = (startup_out + 1) & 0xFFFFFFFF
+            else:
+                next_sequence_in = last_sequence_out = next_user_sequence = None
             cursor = 0
             for index, info in enumerate(infos):
+                source_user_origin = next(
+                    (
+                        struct.unpack_from("<I", info["data"], record[0] + 5)[0]
+                        for record in info["body"]
+                        if record[2] == CMD_USER
+                    ),
+                    None,
+                )
+                output_user_origin = next_user_sequence
+                seen_user = False
                 for record in info["body"]:
                     if record[2] == CMD_STOP or index and record[2] in (
                         CMD_SYNCTICK,
@@ -497,10 +525,41 @@ def join_checkpoint_fragments(paths, target: Path):
                         continue
                     rewritten = rewritten_record(info, record, tick=cursor + record[3])
                     if record[2] == CMD_PACKET:
-                        if next_sequence is None:
-                            next_sequence = struct.unpack_from("<I", rewritten, 81)[0]
-                        struct.pack_into("<II", rewritten, 81, next_sequence, next_sequence)
-                        next_sequence = (next_sequence + 1) & 0xFFFFFFFF
+                        if next_sequence_in is None:
+                            next_sequence_in, last_sequence_out = struct.unpack_from(
+                                "<II", rewritten, 81
+                            )
+                            next_user_sequence = (last_sequence_out + 1) & 0xFFFFFFFF
+                            output_user_origin = next_user_sequence
+                        source_out = struct.unpack_from("<I", rewritten, 85)[0]
+                        if seen_user and source_user_origin is not None:
+                            mapped = (
+                                output_user_origin
+                                + sequence_delta(source_out, source_user_origin)
+                            ) & 0xFFFFFFFF
+                            latest_user = (next_user_sequence - 1) & 0xFFFFFFFF
+                            mapped = max(last_sequence_out, min(mapped, latest_user))
+                            last_sequence_out = mapped
+                        struct.pack_into(
+                            "<II",
+                            rewritten,
+                            81,
+                            next_sequence_in,
+                            last_sequence_out,
+                        )
+                        next_sequence_in = (next_sequence_in + 1) & 0xFFFFFFFF
+                    elif record[2] == CMD_USER:
+                        source_sequence = struct.unpack_from("<I", rewritten, 5)[0]
+                        if source_user_origin is None:
+                            source_user_origin = source_sequence
+                            output_user_origin = next_user_sequence
+                        sequence = (
+                            output_user_origin
+                            + sequence_delta(source_sequence, source_user_origin)
+                        ) & 0xFFFFFFFF
+                        rewrite_user_sequence(rewritten, sequence)
+                        next_user_sequence = (sequence + 1) & 0xFFFFFFFF
+                        seen_user = True
                     output.write(rewritten)
                 cursor += info["ticks"]
             output.write(struct.pack("<Bi", CMD_STOP, ticks))
@@ -1181,6 +1240,13 @@ def parse_time_range(value: str):
 def self_check():
     assert steam_crc(b"abc123") == 3473062748
     assert opus_samples_48k(SILENCE_OPUS) == 960
+    command = bytearray(
+        struct.pack("<BiII", CMD_USER, 0, 7, 5) + ((7 << 1) | 1).to_bytes(5, "little")
+    )
+    rewrite_user_sequence(command, 11)
+    assert struct.unpack_from("<I", command, 5)[0] == 11
+    assert (int.from_bytes(command[13:18], "little") >> 1) & 0xFFFFFFFF == 11
+    assert sequence_delta(1, 0xFFFFFFFF) == 2
     assert normalize_ranges([(5, 9), (1, 3), (3, 6)], 10) == [(1, 9)]
     assert normalize_ranges([(5, 9), (1, 3)], 10, ordered=True) == [(5, 9), (1, 3)]
     assert [bridge_tick(10, index, 5, 3) for index in range(5)] == [10, 10, 11, 11, 12]

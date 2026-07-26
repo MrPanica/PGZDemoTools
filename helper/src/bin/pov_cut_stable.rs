@@ -54,6 +54,48 @@ fn merge_user_cmd(state: &mut Option<UserCmd>, update: &UserCmd) {
     }
 }
 
+fn rebase_user_cmd(
+    packet: &mut Packet<'_>,
+    sequence_origin: &mut Option<u32>,
+    command_origin: &mut Option<u32>,
+    tick_origin: &mut Option<u32>,
+    sequence_base: u32,
+    offset: u32,
+) {
+    let Packet::UserCmd(packet) = packet else {
+        return;
+    };
+    let origin = *sequence_origin.get_or_insert(packet.sequence_out);
+    packet.sequence_out = packet
+        .sequence_out
+        .wrapping_sub(origin)
+        .wrapping_add(sequence_base)
+        .wrapping_add(offset)
+        .wrapping_add(1);
+    if let Some(value) = packet.cmd.command_number.as_mut() {
+        let origin = *command_origin.get_or_insert(*value);
+        *value = value
+            .wrapping_sub(origin)
+            .wrapping_add(sequence_base)
+            .wrapping_add(offset)
+            .wrapping_add(1);
+    }
+    if let Some(value) = packet.cmd.tick_count.as_mut() {
+        let origin = *tick_origin.get_or_insert(*value);
+        *value = value.wrapping_sub(origin).wrapping_add(offset);
+    }
+}
+
+fn account_user_cmd_preamble(
+    packet: &Packet<'_>,
+    sequence_origin: Option<u32>,
+    sequence_base: &mut u32,
+) {
+    if sequence_origin.is_none() && packet.packet_type() == PacketType::Message {
+        *sequence_base = sequence_base.wrapping_add(1);
+    }
+}
+
 fn string_table_update<'a>(packet: &Packet<'a>) -> Option<Packet<'a>> {
     if matches!(packet, Packet::StringTables(_)) {
         return Some(packet.clone());
@@ -188,6 +230,28 @@ fn rebase_entity_times(
         SendPropIdentifier::new("DT_BaseEntity", "m_flSimulationTime");
     const ANIMATION_TIME: SendPropIdentifier =
         SendPropIdentifier::new("DT_AnimTimeMustBeFirst", "m_flAnimTime");
+    const TICK_BASE: SendPropIdentifier =
+        SendPropIdentifier::new("DT_LocalPlayerExclusive", "m_nTickBase");
+    const PLAYER_NEXT_THINK: SendPropIdentifier =
+        SendPropIdentifier::new("DT_LocalPlayerExclusive", "m_nNextThinkTick");
+    const WEAPON_NEXT_THINK: SendPropIdentifier =
+        SendPropIdentifier::new("DT_LocalActiveWeaponData", "m_nNextThinkTick");
+    const NEXT_ATTACK: SendPropIdentifier =
+        SendPropIdentifier::new("DT_BCCLocalPlayerExclusive", "m_flNextAttack");
+    const NEXT_PRIMARY_ATTACK: SendPropIdentifier =
+        SendPropIdentifier::new("DT_LocalActiveWeaponData", "m_flNextPrimaryAttack");
+    const NEXT_SECONDARY_ATTACK: SendPropIdentifier =
+        SendPropIdentifier::new("DT_LocalActiveWeaponData", "m_flNextSecondaryAttack");
+    const WEAPON_IDLE_TIME: SendPropIdentifier =
+        SendPropIdentifier::new("DT_LocalActiveWeaponData", "m_flTimeWeaponIdle");
+    const LAST_CRIT_CHECK_TIME: SendPropIdentifier =
+        SendPropIdentifier::new("DT_LocalTFWeaponData", "m_flLastCritCheckTime");
+    const RELOAD_NEXT_FIRE_TIME: SendPropIdentifier =
+        SendPropIdentifier::new("DT_LocalTFWeaponData", "m_flReloadPriorNextFire");
+    const LAST_FIRE_TIME: SendPropIdentifier =
+        SendPropIdentifier::new("DT_LocalTFWeaponData", "m_flLastFireTime");
+    const EFFECT_REGEN_TIME: SendPropIdentifier =
+        SendPropIdentifier::new("DT_LocalTFWeaponData", "m_flEffectBarRegenTime");
     const INVISIBILITY_TIME: SendPropIdentifier =
         SendPropIdentifier::new("DT_TFPlayerShared", "m_flInvisChangeCompleteTime");
     const STEALTH_NO_ATTACK_TIME: SendPropIdentifier =
@@ -207,7 +271,24 @@ fn rebase_entity_times(
                     *value = (target - network_base(output_tick, entity)).rem_euclid(256);
                 }
             }
-            INVISIBILITY_TIME | STEALTH_NO_ATTACK_TIME | STEALTH_CHANGE_TIME => {
+            TICK_BASE | PLAYER_NEXT_THINK | WEAPON_NEXT_THINK => {
+                if let SendPropValue::Integer(value) = &mut prop.value {
+                    if *value > 0 {
+                        *value += tick_shift;
+                    }
+                }
+            }
+            NEXT_ATTACK
+            | NEXT_PRIMARY_ATTACK
+            | NEXT_SECONDARY_ATTACK
+            | WEAPON_IDLE_TIME
+            | LAST_CRIT_CHECK_TIME
+            | RELOAD_NEXT_FIRE_TIME
+            | LAST_FIRE_TIME
+            | EFFECT_REGEN_TIME
+            | INVISIBILITY_TIME
+            | STEALTH_NO_ATTACK_TIME
+            | STEALTH_CHANGE_TIME => {
                 if let SendPropValue::Float(value) = &mut prop.value {
                     if *value > 0.0 {
                         *value += seconds;
@@ -455,6 +536,50 @@ mod tests {
     }
 
     #[test]
+    fn user_cmd_counters_follow_the_output_timeline() {
+        let mut sequence_origin = None;
+        let mut command_origin = None;
+        let mut tick_origin = None;
+        let mut sequence_base = 1_043;
+        account_user_cmd_preamble(
+            &Packet::Message(Default::default()),
+            sequence_origin,
+            &mut sequence_base,
+        );
+        let mut first = Packet::UserCmd(
+            tf_demo_parser::demo::packet::usercmd::UserCmdPacket {
+                tick: 0u32.into(),
+                sequence_out: 121_090,
+                cmd: UserCmd {
+                    command_number: Some(121_090),
+                    tick_count: Some(124_467),
+                    view_angles: [None; 3],
+                    movement: [None; 3],
+                    buttons: Some(8),
+                    impulse: None,
+                    weapon_select: None,
+                    mouse_dx: None,
+                    mouse_dy: None,
+                },
+            },
+        );
+        rebase_user_cmd(
+            &mut first,
+            &mut sequence_origin,
+            &mut command_origin,
+            &mut tick_origin,
+            sequence_base,
+            1_064,
+        );
+        let Packet::UserCmd(first) = first else {
+            unreachable!()
+        };
+        assert_eq!(first.sequence_out, 2_109);
+        assert_eq!(first.cmd.command_number, Some(2_109));
+        assert_eq!(first.cmd.tick_count, Some(1_064));
+    }
+
+    #[test]
     fn server_tick_rebase_preserves_source_cadence() {
         assert_eq!(
             u32::from(rebase_server_tick(120_050u32.into(), 120_000u32.into(), 900)),
@@ -506,11 +631,30 @@ mod tests {
                 ),
                 value: SendPropValue::Float(0.0),
             },
+            SendProp {
+                index: 4,
+                identifier: SendPropIdentifier::new(
+                    "DT_LocalPlayerExclusive",
+                    "m_nTickBase",
+                ),
+                value: SendPropValue::Integer(90),
+            },
+            SendProp {
+                index: 5,
+                identifier: SendPropIdentifier::new(
+                    "DT_LocalActiveWeaponData",
+                    "m_flNextPrimaryAttack",
+                ),
+                value: SendPropValue::Float(100.0),
+            },
         ];
         rebase_entity_times(&mut props, 1u32.into(), 90u32.into(), 0u32.into(), 1.0);
         assert_eq!(props[2].value, SendPropValue::Float(10.0));
         assert_eq!(props[3].value, SendPropValue::Float(0.0));
+        assert_eq!(props[4].value, SendPropValue::Integer(0));
+        assert_eq!(props[5].value, SendPropValue::Float(10.0));
     }
+
 }
 
 fn main() -> Result<(), MainError> {
@@ -563,12 +707,19 @@ fn main() -> Result<(), MainError> {
     let mut frames = 0u32;
     let mut warmup_ticks = 0u32;
     let mut server_tick_origin = None;
+    let mut user_cmd_sequence_origin = None;
+    let mut user_cmd_command_origin = None;
+    let mut user_cmd_tick_origin = None;
+    let mut user_cmd_sequence_base = 0u32;
 
     while let Some(packet) = packets.next(&source.state_handler)? {
         let after = packets.pos();
         let in_signon = after <= signon_end_bits;
 
         if in_signon {
+            if let Packet::Message(message) | Packet::Signon(message) = &packet {
+                user_cmd_sequence_base = user_cmd_sequence_base.max(message.meta.sequence_out);
+            }
             if let Some(snapshot) =
                 observe_entities(&packet, &source.state_handler, &mut source_snapshots)?
             {
@@ -613,6 +764,11 @@ fn main() -> Result<(), MainError> {
                     continue;
                 }
                 update.set_tick(0u32.into());
+                account_user_cmd_preamble(
+                    &update,
+                    user_cmd_sequence_origin,
+                    &mut user_cmd_sequence_base,
+                );
                 encode_packet(&update, &mut body, &output_handler)?;
                 output_handler.handle_packet(update)?;
                 frames += 1;
@@ -648,6 +804,19 @@ fn main() -> Result<(), MainError> {
                         first_user_cmd = false;
                     }
                 }
+                account_user_cmd_preamble(
+                    &item.packet,
+                    user_cmd_sequence_origin,
+                    &mut user_cmd_sequence_base,
+                );
+                rebase_user_cmd(
+                    &mut item.packet,
+                    &mut user_cmd_sequence_origin,
+                    &mut user_cmd_command_origin,
+                    &mut user_cmd_tick_origin,
+                    user_cmd_sequence_base,
+                    server_tick_offset,
+                );
                 if item.packet.packet_type() == PacketType::SyncTick
                     || item.packet.packet_type() == PacketType::StringTables
                 {
@@ -705,6 +874,19 @@ fn main() -> Result<(), MainError> {
                 if let Some(server_tick) = server_tick {
                     set_server_tick(&mut output_packet, server_tick);
                 }
+                account_user_cmd_preamble(
+                    &output_packet,
+                    user_cmd_sequence_origin,
+                    &mut user_cmd_sequence_base,
+                );
+                rebase_user_cmd(
+                    &mut output_packet,
+                    &mut user_cmd_sequence_origin,
+                    &mut user_cmd_command_origin,
+                    &mut user_cmd_tick_origin,
+                    user_cmd_sequence_base,
+                    server_tick_offset,
+                );
                 if output_packet.packet_type() == PacketType::Message {
                     frames += 1;
                 }
