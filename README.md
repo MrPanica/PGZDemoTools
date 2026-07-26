@@ -1,5 +1,9 @@
 # PGZ Demo Tools
 
+[![PGZ Demo Tools web editor](screenshots/Screenshot_115.png)](screenshots/README.md)
+
+[More screenshots / Больше скриншотов](screenshots/README.md)
+
 Editor for TF2 `.dem` files. Cut and reorder ranges from one demo, inspect events/chat, and export player voices.
 
 ## Requirements
