@@ -176,7 +176,7 @@ def write_edit(info, ranges, target: Path):
     ranges = normalize_ranges(ranges, info["ticks"], ordered=True)
     if info["kind"] == "POV":
         return write_checkpoint_edit(info, ranges, target)
-    return write_source_web(info, ranges, target)
+    return write_source_experiment(info, ranges, target)
 
 
 def bridge_tick(cursor, index, total, ticks):
