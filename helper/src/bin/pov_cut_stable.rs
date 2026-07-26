@@ -13,6 +13,7 @@ use tf_demo_parser::demo::packet::synctick::SyncTickPacket;
 use tf_demo_parser::demo::packet::usercmd::UserCmd;
 use tf_demo_parser::demo::packet::{Packet, PacketType};
 use tf_demo_parser::demo::parser::{DemoHandler, Encode, RawPacketStream};
+use tf_demo_parser::demo::sendprop::{SendProp, SendPropIdentifier, SendPropValue};
 use tf_demo_parser::Demo;
 
 struct HistoryPacket<'a> {
@@ -145,11 +146,87 @@ fn packet_server_tick(packet: &Packet<'_>) -> Option<ServerTick> {
     })
 }
 
+fn set_server_tick(packet: &mut Packet<'_>, tick: ServerTick) {
+    let (Packet::Message(packet) | Packet::Signon(packet)) = packet else {
+        return;
+    };
+    for message in &mut packet.messages {
+        if let Message::NetTick(message) = message {
+            message.tick = tick;
+        }
+    }
+}
+
+fn rebase_server_tick(source: ServerTick, origin: ServerTick, offset: u32) -> ServerTick {
+    (offset + u32::from(source) - u32::from(origin)).into()
+}
+
+fn network_base(tick: i64, entity: EntityId) -> i64 {
+    let entity_mod = i64::from(u32::from(entity) % 32);
+    100 * ((tick - entity_mod) / 100)
+}
+
+fn decode_tick_relative(raw: i64, tick: i64, entity: EntityId) -> i64 {
+    let mut value = network_base(tick, entity) + raw;
+    while value < tick - 127 {
+        value += 256;
+    }
+    while value > tick + 127 {
+        value -= 256;
+    }
+    value
+}
+
+fn rebase_entity_times(
+    props: &mut [SendProp],
+    entity: EntityId,
+    source_tick: ServerTick,
+    output_tick: ServerTick,
+    tick_interval: f32,
+) {
+    const SIMULATION_TIME: SendPropIdentifier =
+        SendPropIdentifier::new("DT_BaseEntity", "m_flSimulationTime");
+    const ANIMATION_TIME: SendPropIdentifier =
+        SendPropIdentifier::new("DT_AnimTimeMustBeFirst", "m_flAnimTime");
+    const INVISIBILITY_TIME: SendPropIdentifier =
+        SendPropIdentifier::new("DT_TFPlayerShared", "m_flInvisChangeCompleteTime");
+    const STEALTH_NO_ATTACK_TIME: SendPropIdentifier =
+        SendPropIdentifier::new("DT_TFPlayerSharedLocal", "m_flStealthNoAttackExpire");
+    const STEALTH_CHANGE_TIME: SendPropIdentifier =
+        SendPropIdentifier::new("DT_TFPlayerSharedLocal", "m_flStealthNextChangeTime");
+    let source_tick = i64::from(u32::from(source_tick));
+    let output_tick = i64::from(u32::from(output_tick));
+    let tick_shift = output_tick - source_tick;
+    let seconds = tick_shift as f32 * tick_interval;
+    for prop in props {
+        match prop.identifier {
+            SIMULATION_TIME | ANIMATION_TIME => {
+                if let SendPropValue::Integer(value) = &mut prop.value {
+                    let target =
+                        decode_tick_relative(*value, source_tick, entity) + tick_shift;
+                    *value = (target - network_base(output_tick, entity)).rem_euclid(256);
+                }
+            }
+            INVISIBILITY_TIME | STEALTH_NO_ATTACK_TIME | STEALTH_CHANGE_TIME => {
+                if let SendPropValue::Float(value) = &mut prop.value {
+                    if *value > 0.0 {
+                        *value += seconds;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn replace_entity_snapshot(
     packet: &mut Packet<'_>,
     current: &EntitySnapshot,
     previous: &mut Option<EntitySnapshot>,
     previous_tick: Option<ServerTick>,
+    current_tick: Option<ServerTick>,
+    source_tick: Option<ServerTick>,
+    tick_interval: f32,
 ) -> bool {
     let (Packet::Message(packet) | Packet::Signon(packet)) = packet else {
         return false;
@@ -180,37 +257,46 @@ fn replace_entity_snapshot(
             .iter()
             .copied()
             .collect::<BTreeSet<_>>();
+        let full_reset =
+            previous.is_none() || previous_tick.is_none() || previous_tick == current_tick;
         let mut entities = Vec::new();
         for current_entity in current.values().filter(|entity| entity.in_pvs) {
             let mut entity;
-            if let Some(old) = previous
-                .as_ref()
-                .and_then(|snapshot| snapshot.get(&current_entity.entity_index))
-            {
-                if old.server_class == current_entity.server_class
-                    && old.serial_number == current_entity.serial_number
+            if !full_reset {
+                if let Some(old) = previous
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.get(&current_entity.entity_index))
                 {
-                    let forced_props = source_updates
-                        .get(&current_entity.entity_index)
-                        .map(|(_, props)| props);
-                    let props = current_entity
-                        .props
-                        .iter()
-                        .filter(|prop| {
-                            forced_props.is_some_and(|props| props.contains(&prop.identifier))
-                                ||
-                            old.props
-                                .binary_search_by_key(&prop.index, |old_prop| old_prop.index)
-                                .map_or(true, |index| old.props[index] != **prop)
-                        })
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    if props.is_empty() && !source_updates.contains_key(&current_entity.entity_index) {
-                        continue;
+                    if old.server_class == current_entity.server_class
+                        && old.serial_number == current_entity.serial_number
+                    {
+                        let forced_props = source_updates
+                            .get(&current_entity.entity_index)
+                            .map(|(_, props)| props);
+                        let props = current_entity
+                            .props
+                            .iter()
+                            .filter(|prop| {
+                                forced_props.is_some_and(|props| props.contains(&prop.identifier))
+                                    ||
+                                old.props
+                                    .binary_search_by_key(&prop.index, |old_prop| old_prop.index)
+                                    .map_or(true, |index| old.props[index] != **prop)
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        if props.is_empty()
+                            && !source_updates.contains_key(&current_entity.entity_index)
+                        {
+                            continue;
+                        }
+                        entity = (**current_entity).clone();
+                        entity.props = props;
+                        entity.update_type = UpdateType::Preserve;
+                    } else {
+                        entity = (**current_entity).clone();
+                        entity.update_type = UpdateType::Enter;
                     }
-                    entity = (**current_entity).clone();
-                    entity.props = props;
-                    entity.update_type = UpdateType::Preserve;
                 } else {
                     entity = (**current_entity).clone();
                     entity.update_type = UpdateType::Enter;
@@ -220,27 +306,38 @@ fn replace_entity_snapshot(
                 entity.update_type = UpdateType::Enter;
             }
             entity.in_pvs = true;
-            entity.delta = previous_tick;
+            if let (Some(source_tick), Some(output_tick)) = (source_tick, current_tick) {
+                rebase_entity_times(
+                    &mut entity.props,
+                    entity.entity_index,
+                    source_tick,
+                    output_tick,
+                    tick_interval,
+                );
+            }
+            entity.delta = if full_reset { None } else { previous_tick };
             entities.push(entity);
         }
-        if let Some(old) = previous.as_ref() {
-            entities.extend(
-                old.iter()
-                    .filter(|(entity, _)| {
-                        !source_removed.contains(entity)
-                            && current.get(entity).is_none_or(|entity| !entity.in_pvs)
-                    })
-                    .map(|(id, entity)| {
-                        let mut entity = (**entity).clone();
-                        entity.update_type = source_updates
-                            .get(id)
-                            .map_or(UpdateType::Leave, |(update_type, _)| *update_type);
-                        entity.props.clear();
-                        entity.delta = previous_tick;
-                        entity
-                    }),
-            );
-            entities.sort_by_key(|entity| entity.entity_index);
+        if !full_reset {
+            if let Some(old) = previous.as_ref() {
+                entities.extend(
+                    old.iter()
+                        .filter(|(entity, _)| {
+                            !source_removed.contains(entity)
+                                && current.get(entity).is_none_or(|entity| !entity.in_pvs)
+                        })
+                        .map(|(id, entity)| {
+                            let mut entity = (**entity).clone();
+                            entity.update_type = source_updates
+                                .get(id)
+                                .map_or(UpdateType::Leave, |(update_type, _)| *update_type);
+                            entity.props.clear();
+                            entity.delta = previous_tick;
+                            entity
+                        }),
+                );
+                entities.sort_by_key(|entity| entity.entity_index);
+            }
         }
         let snapshot = previous.get_or_insert_with(BTreeMap::new);
         for entity in &entities {
@@ -258,12 +355,20 @@ fn replace_entity_snapshot(
         }
         *update = PacketEntitiesMessage {
             entities,
-            removed_entities: source_removed
-                .into_iter()
-                .filter(|entity| previous.as_ref().is_some_and(|old| old.contains_key(entity)))
-                .collect(),
+            removed_entities: if full_reset {
+                Vec::new()
+            } else {
+                source_removed
+                    .into_iter()
+                    .filter(|entity| {
+                        previous
+                            .as_ref()
+                            .is_some_and(|old| old.contains_key(entity))
+                    })
+                    .collect()
+            },
             max_entries: update.max_entries,
-            delta: previous_tick,
+            delta: if full_reset { None } else { previous_tick },
             base_line: update.base_line,
             updated_base_line: false,
         };
@@ -284,6 +389,31 @@ fn encode_packet(
     }
     output.extend_from_slice(&encoded);
     Ok(())
+}
+
+fn string_table_update_key(
+    packet: &Packet<'_>,
+    handler: &DemoHandler<'_, tf_demo_parser::demo::parser::handler::NullHandler>,
+) -> Result<Option<Vec<u8>>, MainError> {
+    let Packet::Message(message) = packet else {
+        return Ok(None);
+    };
+    if message.messages.is_empty()
+        || !message
+            .messages
+            .iter()
+            .all(|message| matches!(message, Message::UpdateStringTable(_)))
+    {
+        return Ok(None);
+    }
+    let mut normalized = packet.clone();
+    normalized.set_tick(0u32.into());
+    if let Packet::Message(message) = &mut normalized {
+        message.meta = Default::default();
+    }
+    let mut key = Vec::new();
+    encode_packet(&normalized, &mut key, handler)?;
+    Ok(Some(key))
 }
 
 #[cfg(test)]
@@ -323,17 +453,80 @@ mod tests {
         assert_eq!(state.view_angles, [Some(1.0), Some(3.0), None]);
         assert_eq!(state.buttons, Some(0));
     }
+
+    #[test]
+    fn server_tick_rebase_preserves_source_cadence() {
+        assert_eq!(
+            u32::from(rebase_server_tick(120_050u32.into(), 120_000u32.into(), 900)),
+            950
+        );
+    }
+
+    #[test]
+    fn entity_clock_rebase_matches_source_network_base() {
+        for entity_index in 1u32..32 {
+            let entity = entity_index.into();
+            for raw in [0, 1, 71, 127, 255] {
+                let source_tick = 124_344i64;
+                let output_tick = 0i64;
+                let source_value = decode_tick_relative(raw, source_tick, entity);
+                let target = source_value + output_tick - source_tick;
+                let encoded = (target - network_base(output_tick, entity)).rem_euclid(256);
+                assert_eq!(
+                    decode_tick_relative(encoded, output_tick, entity) - source_value,
+                    output_tick - source_tick
+                );
+            }
+        }
+
+        let mut props = vec![
+            SendProp {
+                index: 0,
+                identifier: SendPropIdentifier::new("DT_BaseEntity", "m_flSimulationTime"),
+                value: SendPropValue::Integer(100),
+            },
+            SendProp {
+                index: 1,
+                identifier: SendPropIdentifier::new("DT_AnimTimeMustBeFirst", "m_flAnimTime"),
+                value: SendPropValue::Integer(0),
+            },
+            SendProp {
+                index: 2,
+                identifier: SendPropIdentifier::new(
+                    "DT_TFPlayerShared",
+                    "m_flInvisChangeCompleteTime",
+                ),
+                value: SendPropValue::Float(100.0),
+            },
+            SendProp {
+                index: 3,
+                identifier: SendPropIdentifier::new(
+                    "DT_TFPlayerSharedLocal",
+                    "m_flStealthNextChangeTime",
+                ),
+                value: SendPropValue::Float(0.0),
+            },
+        ];
+        rebase_entity_times(&mut props, 1u32.into(), 90u32.into(), 0u32.into(), 1.0);
+        assert_eq!(props[2].value, SendPropValue::Float(10.0));
+        assert_eq!(props[3].value, SendPropValue::Float(0.0));
+    }
 }
 
 fn main() -> Result<(), MainError> {
     let args: Vec<_> = env::args().skip(1).collect();
-    if args.len() != 4 {
-        eprintln!("usage: pov_cut <input.dem> <output.dem> <start-tick> <end-tick>");
+    if !(4..=6).contains(&args.len()) {
+        eprintln!(
+            "usage: pov_cut <input.dem> <output.dem> <start-tick> <end-tick> \
+             [server-tick-offset] [string-table-start-tick]"
+        );
         std::process::exit(2);
     }
     let input = fs::read(&args[0])?;
     let start: u32 = args[2].parse()?;
     let end: u32 = args[3].parse()?;
+    let server_tick_offset: u32 = args.get(4).map_or(Ok(0), |value| value.parse())?;
+    let string_table_start_tick: u32 = args.get(5).map_or(Ok(0), |value| value.parse())?;
     if start >= end {
         return Err("start tick must be before end tick".into());
     }
@@ -341,6 +534,7 @@ fn main() -> Result<(), MainError> {
     let demo = Demo::new(&input);
     let mut stream = demo.get_stream();
     let mut header = Header::read(&mut stream)?;
+    let tick_interval = header.duration / header.ticks as f32;
     if end > header.ticks {
         return Err("end tick exceeds demo duration".into());
     }
@@ -368,6 +562,7 @@ fn main() -> Result<(), MainError> {
     let mut previous_output_tick = None;
     let mut frames = 0u32;
     let mut warmup_ticks = 0u32;
+    let mut server_tick_origin = None;
 
     while let Some(packet) = packets.next(&source.state_handler)? {
         let after = packets.pos();
@@ -395,10 +590,28 @@ fn main() -> Result<(), MainError> {
             let history_start = history.front().map(|item| item.tick).unwrap_or(start);
             warmup_ticks = start - history_start;
 
-            for (_, mut update) in table_updates
+            let updates = table_updates
                 .drain(..)
-                .filter(|(source_tick, _)| *source_tick <= history_start)
-            {
+                .filter(|(source_tick, _)| {
+                    string_table_start_tick <= *source_tick && *source_tick <= history_start
+                })
+                .map(|(source_tick, update)| {
+                    let key = string_table_update_key(&update, &source)?;
+                    Ok((source_tick, update, key))
+                })
+                .collect::<Result<Vec<_>, MainError>>()?;
+            let last_updates = updates
+                .iter()
+                .enumerate()
+                .filter_map(|(index, (_, _, key))| key.clone().map(|key| (key, index)))
+                .collect::<BTreeMap<_, _>>();
+            for (index, (_, mut update, key)) in updates.into_iter().enumerate() {
+                if key
+                    .as_ref()
+                    .is_some_and(|key| last_updates.get(key) != Some(&index))
+                {
+                    continue;
+                }
                 update.set_tick(0u32.into());
                 encode_packet(&update, &mut body, &output_handler)?;
                 output_handler.handle_packet(update)?;
@@ -408,13 +621,19 @@ fn main() -> Result<(), MainError> {
             let mut first_user_cmd = true;
             for mut item in history.drain(..) {
                 if let Some(snapshot) = item.entities.as_ref() {
-                    let server_tick = packet_server_tick(&item.packet)
+                    let source_server_tick = packet_server_tick(&item.packet)
                         .ok_or("packet-entity warmup has no server tick")?;
+                    let origin = *server_tick_origin.get_or_insert(source_server_tick);
+                    let server_tick =
+                        rebase_server_tick(source_server_tick, origin, server_tick_offset);
                     if !replace_entity_snapshot(
                         &mut item.packet,
                         snapshot,
                         &mut previous_output_entities,
                         previous_output_tick,
+                        Some(server_tick),
+                        Some(source_server_tick),
+                        tick_interval,
                     ) {
                         return Err("invalid packet-entity warmup".into());
                     }
@@ -435,6 +654,13 @@ fn main() -> Result<(), MainError> {
                     continue;
                 }
                 item.packet.set_tick((item.tick - history_start).into());
+                if let Some(source_server_tick) = packet_server_tick(&item.packet) {
+                    let origin = *server_tick_origin.get_or_insert(source_server_tick);
+                    set_server_tick(
+                        &mut item.packet,
+                        rebase_server_tick(source_server_tick, origin, server_tick_offset),
+                    );
+                }
                 if item.packet.packet_type() == PacketType::Message {
                     frames += 1;
                 }
@@ -456,14 +682,28 @@ fn main() -> Result<(), MainError> {
             {
                 let mut output_packet = packet.clone();
                 output_packet.set_tick((tick - start + warmup_ticks).into());
+                let source_server_tick = packet_server_tick(&output_packet);
+                let server_tick = source_server_tick.map(|source_server_tick| {
+                    let origin = *server_tick_origin.get_or_insert(source_server_tick);
+                    rebase_server_tick(source_server_tick, origin, server_tick_offset)
+                });
                 if replace_entity_snapshot(
                     &mut output_packet,
                     &entities,
                     &mut previous_output_entities,
                     previous_output_tick,
+                    server_tick,
+                    source_server_tick,
+                    tick_interval,
                 ) {
-                    previous_output_tick = packet_server_tick(&output_packet)
-                        .or_else(|| Some(source.server_tick));
+                    previous_output_tick = server_tick.or_else(|| {
+                        server_tick_origin.map(|origin| {
+                            rebase_server_tick(source.server_tick, origin, server_tick_offset)
+                        })
+                    });
+                }
+                if let Some(server_tick) = server_tick {
+                    set_server_tick(&mut output_packet, server_tick);
                 }
                 if output_packet.packet_type() == PacketType::Message {
                     frames += 1;
