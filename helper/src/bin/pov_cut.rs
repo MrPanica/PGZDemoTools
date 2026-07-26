@@ -971,9 +971,6 @@ fn cut_source_raw_replay(
     let mut next_sequence = last_signon_sequence.wrapping_add(1);
     let mut cursor = 0u32;
     let mut frames = 0u32;
-    let mut timeline_server_origin = None;
-    let mut next_server_tick = None;
-
     for (range_index, (start, end)) in ranges.iter().copied().enumerate() {
         let demo = Demo::new(input);
         let mut range_stream = demo.get_stream();
@@ -986,8 +983,6 @@ fn cut_source_raw_replay(
         // Replay a range's history before its selected packets. This keeps the
         // exact SourceTV delta cache without rebuilding the selected packets.
         let bootstrap_history = start > 0;
-        let mut range_server_origin = None;
-        let mut range_output_origin = None;
         let mut checkpoint_written = range_index == 0;
         let mut range_offset = 0u32;
         // Entity deltas are intentionally not replayed before a later range:
@@ -1058,13 +1053,11 @@ fn cut_source_raw_replay(
                 };
                 let server_tick = packet_server_tick
                     .ok_or("SourceTV boundary PacketEntities has no server tick")?;
+                let source_base_tick = update.delta.map(u32::from).unwrap_or(server_tick);
                 let previous = update
                     .delta
                     .and_then(|tick| source_snapshots.get(&u32::from(tick)).cloned());
-                // Decode the source boundary delta once, then materialize its
-                // resulting state.  Replaying that raw delta after a synthetic
-                // snapshot leaves some client entity state (notably models) in
-                // the old PVS cache.
+                let has_previous = previous.is_some();
                 let current = observe_entities(
                     &packet,
                     &range_source.state_handler,
@@ -1072,7 +1065,7 @@ fn cut_source_raw_replay(
                 )?
                     .ok_or("SourceTV boundary has no entity snapshot")?;
                 let checkpoint_start = cursor;
-                let checkpoint_server_start = next_server_tick.unwrap_or(checkpoint_start);
+                let checkpoint_server_start = source_base_tick;
                 for mut update in table_updates.drain(..) {
                     update.set_tick(cursor.into());
                     let mut update_sequence = Some(next_sequence);
@@ -1091,11 +1084,13 @@ fn cut_source_raw_replay(
                         update.base_line,
                         &range_source.state_handler,
                     )?;
+                    let server_start = checkpoint_server_start
+                        .saturating_sub(chunks.len().saturating_sub(1) as u32);
                     for mut checkpoint in checkpoint_packets(
                         &packet,
                         chunks,
                         checkpoint_start,
-                        checkpoint_server_start,
+                        server_start,
                         update.max_entries,
                         update.base_line,
                     )? {
@@ -1107,58 +1102,43 @@ fn cut_source_raw_replay(
                         checkpoint_ticks = checkpoint_ticks.saturating_add(1);
                     }
                 }
-                let chunks = split_full_snapshot(
-                    &current,
-                    update.max_entries,
-                    update.base_line,
-                    &range_source.state_handler,
-                )?;
-                for mut checkpoint in checkpoint_packets(
-                    &packet,
-                    chunks,
-                    checkpoint_start + checkpoint_ticks,
-                    checkpoint_server_start + checkpoint_ticks,
-                    update.max_entries,
-                    update.base_line,
-                )? {
-                    let mut checkpoint_sequence = Some(next_sequence);
-                    continue_packet_sequence(&mut checkpoint, &mut checkpoint_sequence);
-                    next_sequence = checkpoint_sequence.expect("checkpoint sequence is set");
-                    encode_packet(&checkpoint, &mut body, &range_source)?;
-                    frames = frames.saturating_add(1);
-                    checkpoint_ticks = checkpoint_ticks.saturating_add(1);
+                if !has_previous {
+                    let chunks = split_full_snapshot(
+                        &current,
+                        update.max_entries,
+                        update.base_line,
+                        &range_source.state_handler,
+                    )?;
+                    let server_start =
+                        server_tick.saturating_sub(chunks.len().saturating_sub(1) as u32);
+                    for mut checkpoint in checkpoint_packets(
+                        &packet,
+                        chunks,
+                        checkpoint_start,
+                        server_start,
+                        update.max_entries,
+                        update.base_line,
+                    )? {
+                        let mut checkpoint_sequence = Some(next_sequence);
+                        continue_packet_sequence(&mut checkpoint, &mut checkpoint_sequence);
+                        next_sequence = checkpoint_sequence.expect("checkpoint sequence is set");
+                        encode_packet(&checkpoint, &mut body, &range_source)?;
+                        frames = frames.saturating_add(1);
+                        checkpoint_ticks = checkpoint_ticks.saturating_add(1);
+                    }
                 }
                 if checkpoint_ticks == 0 {
                     return Err("SourceTV boundary snapshot is empty".into());
                 }
-                let checkpoint_end = checkpoint_server_start + checkpoint_ticks - 1;
-                range_server_origin = Some(server_tick);
-                range_output_origin = Some(checkpoint_end);
-                next_server_tick = Some(checkpoint_end.wrapping_add(1));
                 range_offset = checkpoint_ticks;
                 checkpoint_written = true;
-                // The checkpoint replaces this packet's PacketEntities delta.
-                // The following raw packet now resolves its delta against the
-                // checkpoint's final server tick.
-                range_source.handle_packet(packet)?;
-                continue;
+                if !has_previous {
+                    range_source.handle_packet(packet)?;
+                    continue;
+                }
+                // Preserve the source boundary delta. It carries the original
+                // movement and animation cadence from the restored base tick.
             }
-            if let Some(server_tick) = packet_server_tick {
-                let timeline_tick = *timeline_server_origin.get_or_insert(server_tick);
-                let source_origin = *range_server_origin.get_or_insert(server_tick);
-                let output_origin = *range_output_origin.get_or_insert(
-                    next_server_tick.unwrap_or(timeline_tick.saturating_add(cursor)),
-                );
-                let mapped = map_server_tick(server_tick, source_origin, output_origin);
-                next_server_tick = Some(
-                    next_server_tick
-                        .unwrap_or(mapped)
-                        .max(mapped)
-                        .wrapping_add(1),
-                );
-            }
-            let server_tick_map = range_server_origin.zip(range_output_origin);
-
             let kind = packet.packet_type();
             append_raw_packet(
                 input,
@@ -1168,7 +1148,7 @@ fn cut_source_raw_replay(
                 cursor + range_offset + tick - start,
                 kind,
                 &range_source.state_handler,
-                server_tick_map,
+                None,
                 &mut next_sequence,
                 &mut frames,
             )?;
