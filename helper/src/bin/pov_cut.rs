@@ -8,7 +8,9 @@ use tf_demo_parser::demo::header::Header;
 use tf_demo_parser::demo::message::packetentities::{
     BaselineIndex, EntityId, PacketEntitiesMessage, PacketEntity, UpdateType,
 };
+use tf_demo_parser::demo::message::stringtable::UpdateStringTableMessage;
 use tf_demo_parser::demo::message::{Message, MessageType};
+use tf_demo_parser::demo::packet::stringtable::StringTableEntry;
 use tf_demo_parser::demo::packet::synctick::SyncTickPacket;
 use tf_demo_parser::demo::packet::usercmd::UserCmd;
 use tf_demo_parser::demo::packet::{Packet, PacketType};
@@ -24,6 +26,85 @@ struct HistoryPacket<'a> {
 }
 
 type EntitySnapshot = BTreeMap<EntityId, Arc<PacketEntity>>;
+
+#[derive(Clone, Default)]
+struct UserInfoState {
+    table_id: Option<u8>,
+    entries: BTreeMap<u16, StringTableEntry<'static>>,
+}
+
+fn apply_userinfo_entries(
+    state: &mut BTreeMap<u16, StringTableEntry<'static>>,
+    entries: &[(u16, StringTableEntry<'_>)],
+) {
+    for (index, entry) in entries {
+        let mut entry = entry.to_owned();
+        if entry.text.is_none() && entry.extra_data.is_none() {
+            state.remove(index);
+            continue;
+        }
+        let current = state.entry(*index).or_default();
+        if entry.text.is_some() {
+            current.text = entry.text.take();
+        }
+        if entry.extra_data.is_some() {
+            current.extra_data = entry.extra_data.take();
+        }
+    }
+}
+
+fn observe_userinfo<T: AsRef<str>>(
+    packet: &Packet<'_>,
+    table_names: &[T],
+    state: &mut UserInfoState,
+) {
+    if let Packet::StringTables(packet) = packet {
+        if let Some(table) = packet
+            .tables
+            .iter()
+            .find(|table| table.name.as_ref() == "userinfo")
+        {
+            state.entries.clear();
+            apply_userinfo_entries(&mut state.entries, &table.entries);
+        }
+        return;
+    }
+
+    let (Packet::Message(packet) | Packet::Signon(packet)) = packet else {
+        return;
+    };
+    let mut next_table_id = table_names.len() as u8;
+    for message in &packet.messages {
+        match message {
+            Message::CreateStringTable(message) => {
+                if message.table.name.as_ref() == "userinfo" {
+                    state.table_id = Some(next_table_id);
+                    state.entries.clear();
+                    apply_userinfo_entries(&mut state.entries, &message.table.entries);
+                }
+                next_table_id = next_table_id.saturating_add(1);
+            }
+            Message::UpdateStringTable(message) if state.table_id == Some(message.table_id) => {
+                apply_userinfo_entries(&mut state.entries, &message.entries);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn userinfo_reset_entries(
+    current: &BTreeMap<u16, StringTableEntry<'static>>,
+    target: &BTreeMap<u16, StringTableEntry<'static>>,
+) -> Vec<(u16, StringTableEntry<'static>)> {
+    current
+        .keys()
+        .chain(target.keys())
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|index| (index, target.get(&index).cloned().unwrap_or_default()))
+        .collect()
+}
 
 fn clamp_network_strings(value: &mut SendPropValue) {
     match value {
@@ -590,6 +671,38 @@ mod tests {
         assert_eq!(value, 0x1234_5678);
         assert_eq!(bytes[0] & 0b111, 0b101);
     }
+
+    #[test]
+    fn userinfo_reset_replaces_and_clears_slots() {
+        let mut current = BTreeMap::from([
+            (
+                1,
+                StringTableEntry {
+                    text: Some("old".into()),
+                    extra_data: None,
+                },
+            ),
+            (
+                2,
+                StringTableEntry {
+                    text: Some("stale".into()),
+                    extra_data: None,
+                },
+            ),
+        ]);
+        let target = BTreeMap::from([(
+            1,
+            StringTableEntry {
+                text: Some("new".into()),
+                extra_data: None,
+            },
+        )]);
+        let reset = userinfo_reset_entries(&current, &target);
+
+        apply_userinfo_entries(&mut current, &reset);
+
+        assert!(current == target);
+    }
 }
 
 fn cut_source_montage(
@@ -971,6 +1084,7 @@ fn cut_source_raw_replay(
     let mut next_sequence = last_signon_sequence.wrapping_add(1);
     let mut cursor = 0u32;
     let mut frames = 0u32;
+    let mut output_userinfo = UserInfoState::default();
     for (range_index, (start, end)) in ranges.iter().copied().enumerate() {
         let demo = Demo::new(input);
         let mut range_stream = demo.get_stream();
@@ -980,6 +1094,7 @@ fn cut_source_raw_replay(
         let mut range_source = DemoHandler::default();
         range_source.handle_header(&range_header);
         let mut source_snapshots = BTreeMap::new();
+        let mut userinfo = UserInfoState::default();
         // Replay a range's history before its selected packets. This keeps the
         // exact SourceTV delta cache without rebuilding the selected packets.
         let bootstrap_history = start > 0;
@@ -998,6 +1113,7 @@ fn cut_source_raw_replay(
             };
             let raw_end = range_packets.pos() / 8;
             if range_packets.pos() <= range_signon_end {
+                observe_userinfo(&packet, &range_source.string_table_names, &mut userinfo);
                 observe_entities(&packet, &range_source.state_handler, &mut source_snapshots)?;
                 range_source.handle_packet(packet)?;
                 continue;
@@ -1007,6 +1123,7 @@ fn cut_source_raw_replay(
             if tick >= end || matches!(packet, Packet::Stop(_)) {
                 break;
             }
+            observe_userinfo(&packet, &range_source.string_table_names, &mut userinfo);
             let packet_server_tick = match &packet {
                 Packet::Message(message) | Packet::Signon(message) => {
                     message.messages.iter().find_map(|message| {
@@ -1075,6 +1192,25 @@ fn cut_source_raw_replay(
                     if matches!(update.packet_type(), PacketType::Message) {
                         frames = frames.saturating_add(1);
                     }
+                }
+                let userinfo_entries =
+                    userinfo_reset_entries(&output_userinfo.entries, &userinfo.entries);
+                if !userinfo_entries.is_empty() {
+                    let table_id = userinfo
+                        .table_id
+                        .ok_or("SourceTV boundary has no userinfo table")?;
+                    let mut reset = message.clone();
+                    reset.messages = vec![Message::UpdateStringTable(UpdateStringTableMessage {
+                        entries: userinfo_entries,
+                        table_id,
+                    })];
+                    let mut reset = Packet::Message(reset);
+                    reset.set_tick(cursor.into());
+                    let mut reset_sequence = Some(next_sequence);
+                    continue_packet_sequence(&mut reset, &mut reset_sequence);
+                    next_sequence = reset_sequence.expect("userinfo sequence is set");
+                    encode_packet(&reset, &mut body, &range_source)?;
+                    frames = frames.saturating_add(1);
                 }
                 let mut checkpoint_ticks = 0u32;
                 if let Some(previous) = previous {
@@ -1154,6 +1290,7 @@ fn cut_source_raw_replay(
             )?;
             range_source.handle_packet(packet)?;
         }
+        output_userinfo = userinfo;
         cursor = cursor.saturating_add(end - start + range_offset);
     }
     body.push(PacketType::Stop as u8);

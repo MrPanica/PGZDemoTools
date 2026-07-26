@@ -310,11 +310,16 @@ def write_source_web(
 
 
 def write_source_experiment(info, ranges, target: Path):
-    """Cut SourceTV with a state checkpoint at every range boundary."""
+    """Cut SourceTV with the proven raw replay montage path."""
     temporary = target.with_suffix(target.suffix + ".tmp")
     target.parent.mkdir(parents=True, exist_ok=True)
     try:
-        command = [str(helper_binary("pov_cut")), str(info["path"]), str(temporary), "--montage"]
+        command = [
+            str(helper_binary("pov_cut")),
+            str(info["path"]),
+            str(temporary),
+            "--source-raw-replay",
+        ]
         command.extend(str(tick) for pair in ranges for tick in pair)
         result = subprocess.run(
             command,
@@ -333,7 +338,10 @@ def write_source_experiment(info, ranges, target: Path):
             temporary.unlink()
     expected_ticks = sum(end - start for start, end in ranges)
     edited = read_demo(target)
-    if not edited["complete_stop"] or edited["ticks"] != expected_ticks:
+    if not (
+        edited["complete_stop"]
+        and expected_ticks <= edited["ticks"] <= expected_ticks + 64 * len(ranges)
+    ):
         raise ValueError("SourceTV montage verification failed")
     return target
 
@@ -1290,7 +1298,7 @@ def main():
     )
     montage.add_argument("-o", "--output", type=Path)
     source_test = commands.add_parser(
-        "source-montage-test", help="experimental SourceTV state-rebuild montage (CLI only)"
+        "source-montage-test", help="experimental SourceTV raw-replay montage (CLI only)"
     )
     source_test.add_argument("demo", type=Path)
     source_test.add_argument(
@@ -1339,7 +1347,14 @@ def main():
             info = read_demo(args.demo)
             target = args.output or args.demo.with_name(args.demo.stem + ".montage.dem")
             ranges = [(round(start * info["tick_rate"]), round(end * info["tick_rate"])) for start, end in map(parse_time_range, args.range)]
-            write_edit(info, ranges, target)
+            if info["kind"] == "SourceTV":
+                write_source_experiment(
+                    info,
+                    normalize_ranges(ranges, info["ticks"], ordered=True),
+                    target,
+                )
+            else:
+                write_edit(info, ranges, target)
             print(target)
         elif args.command == "source-montage-test":
             info = read_demo(args.demo)
