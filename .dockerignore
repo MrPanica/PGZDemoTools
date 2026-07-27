@@ -3,10 +3,10 @@
 build
 dist
 dist-linux
-helper/target
-__pycache__
+**/target
+.tmp
+.work
 *.dem
 *.tmp
-_pov_warmup_probe.py
 pov_probe_output.txt
 voice-index-check

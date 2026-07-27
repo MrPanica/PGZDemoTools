@@ -9,50 +9,51 @@ Editor for TF2 `.dem` files. Cut and reorder ranges from one demo, inspect event
 ## Requirements
 
 - Windows 10/11 or Linux x86_64
-- Python 3.10 or newer
-- Rust stable + Cargo — required once for `build-helper` (not needed with Docker)
+- Rust 1.85 or newer with Cargo (not needed with Docker or a release binary)
 - `ffmpeg` in `PATH` — only for WAV/MP3 voice export
-- A current browser for the web editor
+- A current browser — only for the web editor
 
-The supplied Linux binary requires glibc 2.38 or newer. Build it on the target system if the server has an older glibc.
+The supplied Linux binary targets Debian 12 / glibc 2.36. Build it on the target system if the server has an older glibc.
 
 ## Manual installation (Windows / Linux)
 
-No Python packages are required. Clone or unpack the project, then build the two helpers once:
+Clone or unpack the project, then build the CLI/web executable and the native desktop companion:
 
 ```sh
 git clone https://github.com/MrPanica/PGZDemoTools.git
 cd PGZDemoTools
-python3 demo_tools.py build-helper
-python3 demo_tools.py serve --host 127.0.0.1 --port 8765
+cargo build --release
+./target/release/PGZDemoTools serve --host 127.0.0.1 --port 8765
 ```
 
-Open `http://127.0.0.1:8765`. Web sessions are kept in `.work` next to the script. Use `--workspace PATH` or `PGZ_DEMO_WORKSPACE` to store them elsewhere.
+On Windows, use `target\release\PGZDemoTools.exe` for CLI/web and `target\release\PGZDemoToolsDesktop.exe` for the native desktop editor. The desktop application is a Rust window with native file dialogs; it does not embed Chromium or Electron. It follows the system theme and language by default, with overrides in Settings. Web sessions are kept in `.work` next to the executable. Use `--workspace PATH` or `PGZ_DEMO_WORKSPACE` to store them elsewhere.
+
+Montage processing runs as a background Rust job, so a reverse proxy does not have to keep one long edit request open. The web progress ring is based on the actual packet position read by the POV/SourceTV cutter; the final download segment is based on transferred bytes. The browser waits up to 300 seconds for progress by default; set `PGZ_DEMO_PROGRESS_TIMEOUT_SECONDS` to a value from 30 to 3600 to change that UI limit. For example:
+
+```sh
+PGZ_DEMO_PROGRESS_TIMEOUT_SECONDS=600 PGZDemoTools serve --no-browser
+```
 
 CLI examples:
 
 ```sh
-python3 demo_tools.py info game.dem
-python3 demo_tools.py montage game.dem --range 30:40 --range 0:10 -o game-edit.dem
-python3 demo_tools.py voice game.dem --all --format mp3 --archive
+PGZDemoTools info game.dem
+PGZDemoTools montage game.dem --range 30:40 --range 0:10 -o game-edit.dem
+PGZDemoTools voice game.dem --all --format mp3 --archive
 ```
 
 Ranges keep the order supplied. They may be non-chronological, but they must belong to the same demo. POV edits retain the original recording player.
 
-Build the standalone program separately on each target OS:
+For POV demos, the web editor can apply **Unlock free camera** after the montage is built. The resulting file is a SourceTV spectator demo with a detached roaming camera. The option is intentionally hidden for SourceTV inputs, and the output size normally stays close to the ordinary montage.
 
-```sh
-python -m PyInstaller --clean --noconfirm PGZDemoTools.spec
-```
-
-The output is `dist/PGZDemoTools.exe` on Windows and `dist/PGZDemoTools` on Linux.
+The HTML/JavaScript editor and both POV/SourceTV cutters are embedded in that executable. `build-helper` remains a compatibility no-op.
 
 ## Manual nginx setup (Linux)
 
 Run the editor locally on the server and proxy nginx to it:
 
 ```sh
-python3 demo_tools.py serve --host 127.0.0.1 --port 8765 --no-browser
+PGZDemoTools serve --host 127.0.0.1 --port 8765 --no-browser
 ```
 
 Use this nginx server block, replacing `demo.example.com`:
@@ -71,6 +72,7 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 900s;
     }
 }
 ```
@@ -103,7 +105,21 @@ docker compose build
 docker compose -f compose.nginx-php.yaml up -d
 ```
 
-Open `http://SERVER_IP:8771`. Stop it with `docker compose -f compose.nginx-php.yaml down`. PHP is included only for an existing PHP site; the editor is the Python/Rust service behind nginx.
+Open `http://SERVER_IP:8771`. Stop it with `docker compose -f compose.nginx-php.yaml down`. PHP is included only for an existing PHP site; the editor is the Rust service behind nginx.
+
+## Third-party components
+
+- [demostf/parser](https://github.com/demostf/parser) — the bundled and locally patched `tf-demo-parser` fork used for TF2 packet parsing.
+- [tiny-http](https://github.com/tiny-http/tiny-http) — the embedded local HTTP server.
+- [clap](https://github.com/clap-rs/clap) and [Serde](https://github.com/serde-rs/serde) — CLI and JSON serialization.
+- [zip-rs](https://github.com/zip-rs/zip2) — voice archive creation.
+- [egui / eframe](https://github.com/emilk/egui) — native desktop UI renderer, not a browser engine.
+- [rfd](https://github.com/PolyMeilex/rfd) — native open/save file dialogs.
+- [sys-locale](https://github.com/1Password/sys-locale) — system-language detection for the desktop UI.
+- [lamejs](https://github.com/zhuker/lamejs) / [LAME](https://github.com/lameproject/lame) — browser-side MP3 encoding; the bundled license notice is in `LAMEJS-LICENSE.txt`.
+- [FFmpeg](https://github.com/FFmpeg/FFmpeg) — optional external WAV/MP3 converter used only by the CLI.
+
+The complete direct Rust dependency list is in `Cargo.toml`; exact resolved versions, including transitive crates, are in `Cargo.lock`.
 
 ---
 
@@ -114,50 +130,51 @@ Open `http://SERVER_IP:8771`. Stop it with `docker compose -f compose.nginx-php.
 ## Требования
 
 - Windows 10/11 или Linux x86_64
-- Python 3.10 или новее
-- Rust stable и Cargo — один раз для `build-helper` (в Docker не нужны)
+- Rust 1.85 или новее с Cargo (не нужен при запуске через Docker или готовый бинарник)
 - `ffmpeg` в `PATH` — только для экспорта голосов в WAV/MP3
-- Современный браузер для веб-редактора
+- Современный браузер — только для веб-редактора
 
-Готовому Linux-бинарнику нужна glibc 2.38 или новее. На более старом сервере соберите бинарник на самом сервере.
+Готовый Linux-бинарник рассчитан на Debian 12 / glibc 2.36. На более старом сервере соберите бинарник на самом сервере.
 
 ## Ручная установка (Windows / Linux)
 
-Python-пакеты не нужны. Клонируйте или распакуйте проект и один раз соберите два помощника:
+Клонируйте или распакуйте проект и соберите CLI/веб-бинарник и нативное desktop-приложение:
 
 ```sh
 git clone https://github.com/MrPanica/PGZDemoTools.git
 cd PGZDemoTools
-python3 demo_tools.py build-helper
-python3 demo_tools.py serve --host 127.0.0.1 --port 8765
+cargo build --release
+./target/release/PGZDemoTools serve --host 127.0.0.1 --port 8765
 ```
 
-Откройте `http://127.0.0.1:8765`. Веб-сессии лежат в `.work` рядом со скриптом. Путь меняется через `--workspace PATH` или `PGZ_DEMO_WORKSPACE`.
+В Windows используйте `target\release\PGZDemoTools.exe` для CLI/веба и `target\release\PGZDemoToolsDesktop.exe` для нативного desktop-редактора. Desktop-приложение — это Rust-окно с нативными файловыми диалогами, без Chromium и Electron. По умолчанию оно подхватывает тему и язык системы; их можно изменить в «Настройках». Веб-сессии лежат в `.work` рядом с исполняемым файлом. Путь меняется через `--workspace PATH` или `PGZ_DEMO_WORKSPACE`.
+
+Монтаж обрабатывается фоновой Rust-задачей, поэтому reverse proxy не обязан держать один долгий запрос нарезки. Кольцо прогресса веба строится по фактической позиции пакетов, которую уже читает резак POV/SourceTV; финальная часть скачивания считается по переданным байтам. По умолчанию браузер ждёт прогресс до 300 секунд; лимит интерфейса меняется переменной `PGZ_DEMO_PROGRESS_TIMEOUT_SECONDS` в пределах 30–3600 секунд. Например:
+
+```sh
+PGZ_DEMO_PROGRESS_TIMEOUT_SECONDS=600 PGZDemoTools serve --no-browser
+```
 
 Примеры CLI:
 
 ```sh
-python3 demo_tools.py info game.dem
-python3 demo_tools.py montage game.dem --range 30:40 --range 0:10 -o game-edit.dem
-python3 demo_tools.py voice game.dem --all --format mp3 --archive
+PGZDemoTools info game.dem
+PGZDemoTools montage game.dem --range 30:40 --range 0:10 -o game-edit.dem
+PGZDemoTools voice game.dem --all --format mp3 --archive
 ```
 
 Отрезки записываются в указанном порядке. Они могут идти не по хронологии, но должны принадлежать одной демке. В POV-монтаже сохраняется исходный игрок записи.
 
-Автономный файл собирайте отдельно в каждой целевой ОС:
+Для POV-демок в веб-редакторе есть флажок **«Разблокировать свободную камеру»**. Он применяется после сборки монтажа и создаёт SourceTV-демку с отвязанной свободной камерой наблюдателя. Для исходных SourceTV флажок скрыт; размер результата обычно остаётся близким к обычному монтажу.
 
-```sh
-python -m PyInstaller --clean --noconfirm PGZDemoTools.spec
-```
-
-Результат: `dist/PGZDemoTools.exe` в Windows и `dist/PGZDemoTools` в Linux.
+HTML/JavaScript-интерфейс и рабочие обработчики POV/SourceTV встроены в этот файл. `build-helper` оставлен совместимой no-op-командой.
 
 ## Ручная установка nginx (Linux)
 
 Запустите редактор локально на сервере и проксируйте к нему nginx:
 
 ```sh
-python3 demo_tools.py serve --host 127.0.0.1 --port 8765 --no-browser
+PGZDemoTools serve --host 127.0.0.1 --port 8765 --no-browser
 ```
 
 Создайте конфигурацию nginx, заменив `demo.example.com`:
@@ -176,6 +193,7 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 900s;
     }
 }
 ```
@@ -208,4 +226,18 @@ docker compose build
 docker compose -f compose.nginx-php.yaml up -d
 ```
 
-Откройте `http://SERVER_IP:8771`. Остановка: `docker compose -f compose.nginx-php.yaml down`. PHP добавлен только для существующего PHP-сайта; редактор — Python/Rust-сервис за nginx.
+Откройте `http://SERVER_IP:8771`. Остановка: `docker compose -f compose.nginx-php.yaml down`. PHP добавлен только для существующего PHP-сайта; редактор — Rust-сервис за nginx.
+
+## Сторонние компоненты
+
+- [demostf/parser](https://github.com/demostf/parser) — встроенный и локально исправленный форк `tf-demo-parser` для разбора пакетов TF2.
+- [tiny-http](https://github.com/tiny-http/tiny-http) — встроенный локальный HTTP-сервер.
+- [clap](https://github.com/clap-rs/clap) и [Serde](https://github.com/serde-rs/serde) — CLI и сериализация JSON.
+- [zip-rs](https://github.com/zip-rs/zip2) — создание ZIP-архивов с голосами.
+- [egui / eframe](https://github.com/emilk/egui) — нативный renderer desktop-интерфейса, не браузерный движок.
+- [rfd](https://github.com/PolyMeilex/rfd) — нативные диалоги открытия и сохранения файлов.
+- [sys-locale](https://github.com/1Password/sys-locale) — определение системного языка для desktop-интерфейса.
+- [lamejs](https://github.com/zhuker/lamejs) / [LAME](https://github.com/lameproject/lame) — кодирование MP3 в браузере; уведомление о лицензии лежит в `LAMEJS-LICENSE.txt`.
+- [FFmpeg](https://github.com/FFmpeg/FFmpeg) — необязательный внешний конвертер WAV/MP3, используемый только CLI.
+
+Полный список прямых Rust-зависимостей находится в `Cargo.toml`; точные версии, включая транзитивные зависимости, зафиксированы в `Cargo.lock`.

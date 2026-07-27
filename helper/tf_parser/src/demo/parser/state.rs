@@ -151,7 +151,7 @@ impl ParserState {
         class_id: ClassId,
         send_table: &SendTable,
         is_delta: bool,
-    ) -> Result<Cow<[SendProp]>> {
+    ) -> Result<Cow<'_, [SendProp]>> {
         match self.get_instance_baseline(baseline_index).get(entity_index) {
             Some(baseline) if baseline.server_class == class_id && is_delta => {
                 Ok(Cow::Borrowed(&baseline.props))

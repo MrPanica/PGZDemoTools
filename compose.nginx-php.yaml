@@ -1,7 +1,9 @@
 services:
   app:
     image: demotools-pgz-demo-tools:latest
-    command: ["python", "demo_tools.py", "serve", "--host", "0.0.0.0", "--port", "8765", "--no-browser"]
+    command: ["/app/PGZDemoTools", "serve", "--host", "0.0.0.0", "--port", "8765", "--no-browser"]
+    environment:
+      PGZ_DEMO_PROGRESS_TIMEOUT_SECONDS: ${PGZ_DEMO_PROGRESS_TIMEOUT_SECONDS:-300}
     expose:
       - "8765"
 

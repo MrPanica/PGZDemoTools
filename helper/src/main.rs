@@ -1,8 +1,11 @@
+#![allow(clippy::items_after_test_module)]
+
 use main_error::MainError;
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io::Write;
+use std::path::Path;
 use tf_demo_parser::demo::data::DemoTick;
 use tf_demo_parser::demo::gamevent::GameEvent;
 use tf_demo_parser::demo::message::usermessage::{ChatMessageKind, HudTextLocation, UserMessage};
@@ -36,7 +39,10 @@ struct Collector {
 }
 
 fn clean(value: impl AsRef<str>) -> String {
-    value.as_ref().replace(['\t', '\r', '\n'], " ")
+    value
+        .as_ref()
+        .replace(['\t', '\r', '\n'], " ")
+        .replace('\u{fffd}', "?")
 }
 
 fn clean_chat(value: impl AsRef<str>) -> String {
@@ -111,13 +117,14 @@ impl Collector {
 
 #[cfg(test)]
 mod tests {
-    use super::placeholder_chat;
+    use super::{clean, placeholder_chat};
 
     #[test]
     fn filters_parser_placeholders_but_not_chat() {
         assert!(placeholder_chat("Q", "Q"));
         assert!(placeholder_chat("C", "C"));
         assert!(!placeholder_chat("Bob", "Q"));
+        assert_eq!(clean("bad\u{fffd}name"), "bad?name");
     }
 }
 
@@ -293,20 +300,13 @@ impl MessageHandler for Collector {
     }
 }
 
-fn main() -> Result<(), MainError> {
-    let args: Vec<_> = env::args().collect();
-    if args.len() < 3 {
-        eprintln!("usage: voice_extract <demo.dem> <output_dir>");
-        std::process::exit(1);
-    }
-    let out_dir = &args[2];
+pub fn extract_demo_index(file: &[u8], out_dir: &Path) -> Result<(), MainError> {
     fs::create_dir_all(out_dir)?;
 
-    let file = fs::read(&args[1])?;
-    let parser = DemoParser::new_with_analyser(Demo::new(&file).get_stream(), Collector::default());
+    let parser = DemoParser::new_with_analyser(Demo::new(file).get_stream(), Collector::default());
     let (_header, result) = parser.parse()?;
 
-    let mut players_file = fs::File::create(format!("{}/players.tsv", out_dir))?;
+    let mut players_file = fs::File::create(out_dir.join("players.tsv"))?;
     writeln!(
         players_file,
         "entity_id\tclient_id\tname\tsteamid\tpacket_count\tfirst_tick\tlast_tick"
@@ -327,7 +327,7 @@ fn main() -> Result<(), MainError> {
         )?;
     }
 
-    let mut all_players_file = fs::File::create(format!("{}/all_players.tsv", out_dir))?;
+    let mut all_players_file = fs::File::create(out_dir.join("all_players.tsv"))?;
     writeln!(all_players_file, "entity_id\tname\tsteamid\tuser_id")?;
     for (entity_id, player) in &result.players {
         writeln!(
@@ -340,10 +340,10 @@ fn main() -> Result<(), MainError> {
         )?;
     }
 
-    let frames_dir = format!("{}/frames", out_dir);
+    let frames_dir = out_dir.join("frames");
     fs::create_dir_all(&frames_dir)?;
     for (client_id, packets) in &result.packets {
-        let mut frames_file = fs::File::create(format!("{}/{}.txt", frames_dir, client_id))?;
+        let mut frames_file = fs::File::create(frames_dir.join(format!("{}.txt", client_id)))?;
         for (tick, raw) in packets {
             let hex = raw
                 .iter()
@@ -353,7 +353,7 @@ fn main() -> Result<(), MainError> {
         }
     }
 
-    let mut events_file = fs::File::create(format!("{}/events.tsv", out_dir))?;
+    let mut events_file = fs::File::create(out_dir.join("events.tsv"))?;
     writeln!(events_file, "tick\tkind\tactor\ttarget\tdetail")?;
     for event in &result.events {
         writeln!(
@@ -370,4 +370,14 @@ fn main() -> Result<(), MainError> {
         result.events.len()
     );
     Ok(())
+}
+
+fn main() -> Result<(), MainError> {
+    let args: Vec<_> = env::args().collect();
+    if args.len() < 3 {
+        eprintln!("usage: voice_extract <demo.dem> <output_dir>");
+        std::process::exit(1);
+    }
+    let file = fs::read(&args[1])?;
+    extract_demo_index(&file, Path::new(&args[2]))
 }

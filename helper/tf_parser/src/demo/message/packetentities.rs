@@ -558,7 +558,7 @@ impl PacketEntitiesMessage {
         let mut last_index: i32 = -1;
 
         let mut props: Vec<&SendProp> = props.into_iter().collect();
-        props.sort_by(|a, b| a.index.cmp(&b.index));
+        props.sort_by_key(|prop| prop.index);
 
         for prop in props {
             true.write(stream)?;

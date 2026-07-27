@@ -1,7 +1,7 @@
+use crate::demo::parser::{Encode, ParseBitSkip};
+use crate::{Parse, ParserState, Result, Stream};
 use bitbuffer::{BitWriteStream, LittleEndian};
 use serde::{Deserialize, Serialize};
-use crate::{Parse, ParserState, Stream, Result};
-use crate::demo::parser::{Encode, ParseBitSkip};
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]

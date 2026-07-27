@@ -1,6 +1,14 @@
+#![allow(
+    clippy::items_after_test_module,
+    clippy::manual_is_multiple_of,
+    clippy::too_many_arguments,
+    clippy::while_let_loop
+)]
+
 use bitbuffer::{BitRead, BitReadBuffer, BitReadStream, BitWrite, BitWriteStream, LittleEndian};
 use main_error::MainError;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::path::Path;
 use std::sync::Arc;
 use std::{env, fs};
 use tf_demo_parser::demo::data::ServerTick;
@@ -833,16 +841,14 @@ fn cut_source_montage(
                     &output_handler.state_handler,
                 )?;
                 let checkpoint_ticks = chunks.len() as u32;
-                for mut checkpoint in
-                    checkpoint_packets(
-                        &packet,
-                        chunks,
-                        checkpoint_start,
-                        checkpoint_start,
-                        max_entries,
-                        baseline,
-                    )?
-                {
+                for mut checkpoint in checkpoint_packets(
+                    &packet,
+                    chunks,
+                    checkpoint_start,
+                    checkpoint_start,
+                    max_entries,
+                    baseline,
+                )? {
                     continue_packet_sequence(&mut checkpoint, &mut next_output_sequence);
                     frames += 1;
                     encode_packet(&checkpoint, &mut body, &output_handler)?;
@@ -898,8 +904,7 @@ fn cut_source_montage(
     header.duration = cursor as f32 / tick_rate;
     header.frames = frames;
     let signon = &input[header_bytes..signon_end_bytes];
-    let mut output =
-        Vec::with_capacity(header_bytes + signon.len() + body.len());
+    let mut output = Vec::with_capacity(header_bytes + signon.len() + body.len());
     {
         let mut output_stream = BitWriteStream::new(&mut output, LittleEndian);
         header.write(&mut output_stream)?;
@@ -1036,10 +1041,19 @@ fn write_le_bits(bytes: &mut [u8], bit_offset: usize, value: u32) -> Result<(), 
     Ok(())
 }
 
-fn cut_source_raw_replay(
+pub fn cut_source_raw_replay(
     input: &[u8],
-    output_path: &str,
+    output_path: &Path,
     ranges: &[(u32, u32)],
+) -> Result<(), MainError> {
+    cut_source_raw_replay_with_progress(input, output_path, ranges, &mut |_| {})
+}
+
+pub fn cut_source_raw_replay_with_progress(
+    input: &[u8],
+    output_path: &Path,
+    ranges: &[(u32, u32)],
+    progress: &mut dyn FnMut(u8),
 ) -> Result<(), MainError> {
     if ranges.is_empty() || ranges.iter().any(|(start, end)| start >= end) {
         return Err("source raw replay needs non-empty start/end tick pairs".into());
@@ -1085,6 +1099,8 @@ fn cut_source_raw_replay(
     let mut cursor = 0u32;
     let mut frames = 0u32;
     let mut output_userinfo = UserInfoState::default();
+    let mut last_progress = 0;
+    progress(last_progress);
     for (range_index, (start, end)) in ranges.iter().copied().enumerate() {
         let demo = Demo::new(input);
         let mut range_stream = demo.get_stream();
@@ -1112,6 +1128,13 @@ fn cut_source_raw_replay(
                 break;
             };
             let raw_end = range_packets.pos() / 8;
+            let current_progress = ((range_index * 100
+                + (raw_end.saturating_mul(100) / input.len().max(1)))
+                / ranges.len()) as u8;
+            if current_progress > last_progress {
+                last_progress = current_progress;
+                progress(current_progress);
+            }
             if range_packets.pos() <= range_signon_end {
                 observe_userinfo(&packet, &range_source.string_table_names, &mut userinfo);
                 observe_entities(&packet, &range_source.state_handler, &mut source_snapshots)?;
@@ -1175,12 +1198,9 @@ fn cut_source_raw_replay(
                     .delta
                     .and_then(|tick| source_snapshots.get(&u32::from(tick)).cloned());
                 let has_previous = previous.is_some();
-                let current = observe_entities(
-                    &packet,
-                    &range_source.state_handler,
-                    &mut source_snapshots,
-                )?
-                    .ok_or("SourceTV boundary has no entity snapshot")?;
+                let current =
+                    observe_entities(&packet, &range_source.state_handler, &mut source_snapshots)?
+                        .ok_or("SourceTV boundary has no entity snapshot")?;
                 let checkpoint_start = cursor;
                 let checkpoint_server_start = source_base_tick;
                 for mut update in table_updates.drain(..) {
@@ -1319,6 +1339,7 @@ fn cut_source_raw_replay(
     output.extend_from_slice(&body);
     validate_demo(&output)?;
     fs::write(output_path, output)?;
+    progress(100);
     eprintln!(
         "wrote {frames} raw SourceTV frames across {} ranges",
         ranges.len()
@@ -1336,7 +1357,7 @@ fn main() -> Result<(), MainError> {
             .chunks_exact(2)
             .map(|pair| Ok((pair[0].parse()?, pair[1].parse()?)))
             .collect::<Result<Vec<(u32, u32)>, MainError>>()?;
-        return cut_source_raw_replay(&fs::read(&args[0])?, &args[1], &ranges);
+        return cut_source_raw_replay(&fs::read(&args[0])?, Path::new(&args[1]), &ranges);
     }
     if args.len() >= 5 && args[2] == "--montage" {
         if (args.len() - 3) % 2 != 0 {

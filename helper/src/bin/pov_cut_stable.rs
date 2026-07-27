@@ -1,6 +1,9 @@
+#![allow(clippy::items_after_test_module)]
+
 use bitbuffer::{BitRead, BitWrite, BitWriteStream, LittleEndian};
 use main_error::MainError;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::path::Path;
 use std::sync::Arc;
 use std::{env, fs};
 use tf_demo_parser::demo::data::ServerTick;
@@ -170,7 +173,10 @@ fn observe_entities(
         }
         snapshots.insert(tick, entities.clone());
         while snapshots.len() > 128 {
-            let oldest = *snapshots.keys().next().expect("snapshot cache is not empty");
+            let oldest = *snapshots
+                .keys()
+                .next()
+                .expect("snapshot cache is not empty");
             snapshots.remove(&oldest);
         }
         result = Some(entities);
@@ -266,8 +272,7 @@ fn rebase_entity_times(
         match prop.identifier {
             SIMULATION_TIME | ANIMATION_TIME => {
                 if let SendPropValue::Integer(value) = &mut prop.value {
-                    let target =
-                        decode_tick_relative(*value, source_tick, entity) + tick_shift;
+                    let target = decode_tick_relative(*value, source_tick, entity) + tick_shift;
                     *value = (target - network_base(output_tick, entity)).rem_euclid(256);
                 }
             }
@@ -359,10 +364,12 @@ fn replace_entity_snapshot(
                             .iter()
                             .filter(|prop| {
                                 forced_props.is_some_and(|props| props.contains(&prop.identifier))
-                                    ||
-                                old.props
-                                    .binary_search_by_key(&prop.index, |old_prop| old_prop.index)
-                                    .map_or(true, |index| old.props[index] != **prop)
+                                    || old
+                                        .props
+                                        .binary_search_by_key(&prop.index, |old_prop| {
+                                            old_prop.index
+                                        })
+                                        .map_or(true, |index| old.props[index] != **prop)
                             })
                             .cloned()
                             .collect::<Vec<_>>();
@@ -546,23 +553,21 @@ mod tests {
             sequence_origin,
             &mut sequence_base,
         );
-        let mut first = Packet::UserCmd(
-            tf_demo_parser::demo::packet::usercmd::UserCmdPacket {
-                tick: 0u32.into(),
-                sequence_out: 121_090,
-                cmd: UserCmd {
-                    command_number: Some(121_090),
-                    tick_count: Some(124_467),
-                    view_angles: [None; 3],
-                    movement: [None; 3],
-                    buttons: Some(8),
-                    impulse: None,
-                    weapon_select: None,
-                    mouse_dx: None,
-                    mouse_dy: None,
-                },
+        let mut first = Packet::UserCmd(tf_demo_parser::demo::packet::usercmd::UserCmdPacket {
+            tick: 0u32.into(),
+            sequence_out: 121_090,
+            cmd: UserCmd {
+                command_number: Some(121_090),
+                tick_count: Some(124_467),
+                view_angles: [None; 3],
+                movement: [None; 3],
+                buttons: Some(8),
+                impulse: None,
+                weapon_select: None,
+                mouse_dx: None,
+                mouse_dy: None,
             },
-        );
+        });
         rebase_user_cmd(
             &mut first,
             &mut sequence_origin,
@@ -582,7 +587,11 @@ mod tests {
     #[test]
     fn server_tick_rebase_preserves_source_cadence() {
         assert_eq!(
-            u32::from(rebase_server_tick(120_050u32.into(), 120_000u32.into(), 900)),
+            u32::from(rebase_server_tick(
+                120_050u32.into(),
+                120_000u32.into(),
+                900
+            )),
             950
         );
     }
@@ -633,10 +642,7 @@ mod tests {
             },
             SendProp {
                 index: 4,
-                identifier: SendPropIdentifier::new(
-                    "DT_LocalPlayerExclusive",
-                    "m_nTickBase",
-                ),
+                identifier: SendPropIdentifier::new("DT_LocalPlayerExclusive", "m_nTickBase"),
                 value: SendPropValue::Integer(90),
             },
             SendProp {
@@ -654,28 +660,41 @@ mod tests {
         assert_eq!(props[4].value, SendPropValue::Integer(0));
         assert_eq!(props[5].value, SendPropValue::Float(10.0));
     }
-
 }
 
-fn main() -> Result<(), MainError> {
-    let args: Vec<_> = env::args().skip(1).collect();
-    if !(4..=6).contains(&args.len()) {
-        eprintln!(
-            "usage: pov_cut <input.dem> <output.dem> <start-tick> <end-tick> \
-             [server-tick-offset] [string-table-start-tick]"
-        );
-        std::process::exit(2);
-    }
-    let input = fs::read(&args[0])?;
-    let start: u32 = args[2].parse()?;
-    let end: u32 = args[3].parse()?;
-    let server_tick_offset: u32 = args.get(4).map_or(Ok(0), |value| value.parse())?;
-    let string_table_start_tick: u32 = args.get(5).map_or(Ok(0), |value| value.parse())?;
+pub fn cut_pov(
+    input: &[u8],
+    output_path: &Path,
+    start: u32,
+    end: u32,
+    server_tick_offset: u32,
+    string_table_start_tick: u32,
+) -> Result<(), MainError> {
+    cut_pov_with_progress(
+        input,
+        output_path,
+        start,
+        end,
+        server_tick_offset,
+        string_table_start_tick,
+        &mut |_| {},
+    )
+}
+
+pub fn cut_pov_with_progress(
+    input: &[u8],
+    output_path: &Path,
+    start: u32,
+    end: u32,
+    server_tick_offset: u32,
+    string_table_start_tick: u32,
+    progress: &mut dyn FnMut(u8),
+) -> Result<(), MainError> {
     if start >= end {
         return Err("start tick must be before end tick".into());
     }
 
-    let demo = Demo::new(&input);
+    let demo = Demo::new(input);
     let mut stream = demo.get_stream();
     let mut header = Header::read(&mut stream)?;
     let tick_interval = header.duration / header.ticks as f32;
@@ -711,9 +730,16 @@ fn main() -> Result<(), MainError> {
     let mut user_cmd_command_origin = None;
     let mut user_cmd_tick_origin = None;
     let mut user_cmd_sequence_base = 0u32;
+    let mut last_progress = 0;
+    progress(last_progress);
 
     while let Some(packet) = packets.next(&source.state_handler)? {
         let after = packets.pos();
+        let current_progress = ((after / 8).saturating_mul(100) / input.len().max(1)) as u8;
+        if current_progress > last_progress {
+            last_progress = current_progress;
+            progress(current_progress);
+        }
         let in_signon = after <= signon_end_bits;
 
         if in_signon {
@@ -946,7 +972,8 @@ fn main() -> Result<(), MainError> {
     }
     output.extend_from_slice(signon);
     output.extend_from_slice(&body);
-    fs::write(&args[1], output)?;
+    fs::write(output_path, output)?;
+    progress(100);
     eprintln!(
         "wrote {} frames with {} entities and {} warmup ticks",
         frames,
@@ -954,4 +981,24 @@ fn main() -> Result<(), MainError> {
         warmup_ticks
     );
     Ok(())
+}
+
+fn main() -> Result<(), MainError> {
+    let args: Vec<_> = env::args().skip(1).collect();
+    if !(4..=6).contains(&args.len()) {
+        eprintln!(
+            "usage: pov_cut <input.dem> <output.dem> <start-tick> <end-tick> \
+             [server-tick-offset] [string-table-start-tick]"
+        );
+        std::process::exit(2);
+    }
+    let input = fs::read(&args[0])?;
+    cut_pov(
+        &input,
+        Path::new(&args[1]),
+        args[2].parse()?,
+        args[3].parse()?,
+        args.get(4).map_or(Ok(0), |value| value.parse())?,
+        args.get(5).map_or(Ok(0), |value| value.parse())?,
+    )
 }

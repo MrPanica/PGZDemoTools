@@ -65,11 +65,12 @@ impl<'a> Parse<'a> for ServerInfoMessage {
 impl<'a> ParseBitSkip<'a> for ServerInfoMessage {
     fn parse_skip(stream: &mut Stream<'a>, state: &ParserState) -> Result<()> {
         let version_dependent_size = match state.protocol_version {
-            0..=15 => 4 * 8, // only the 4 byte crc
+            0..=15 => 4 * 8,      // only the 4 byte crc
             16..=17 => 4 * 8 + 1, // adds the 1 bit replay flag
-            18.. => 16 * 8 + 1, // replaces 4 byte crc with an 16 byte hash
+            18.. => 16 * 8 + 1,   // replaces 4 byte crc with an 16 byte hash
         };
-        let size = <ServerInfoMessagePart1 as BitRead<LittleEndian>>::bit_size().unwrap_or_default()
+        let size = <ServerInfoMessagePart1 as BitRead<LittleEndian>>::bit_size()
+            .unwrap_or_default()
             + <ServerInfoMessagePart2 as BitRead<LittleEndian>>::bit_size().unwrap_or_default()
             + version_dependent_size;
         stream.skip_bits(size)?;

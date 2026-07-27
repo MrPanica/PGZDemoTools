@@ -14,6 +14,7 @@ static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 struct JsonDemo {
     header: Header,
     #[serde(flatten)]
@@ -53,12 +54,7 @@ fn main() -> Result<(), MainError> {
             let shooter = state
                 .players
                 .iter()
-                .find(|player| {
-                    player
-                        .weapons
-                        .iter()
-                        .any(|weapon| collision.projectile.launcher == *weapon)
-                })
+                .find(|player| player.weapons.contains(&collision.projectile.launcher))
                 .and_then(|player| player.info.as_ref());
 
             if let Some(shooter) = shooter {

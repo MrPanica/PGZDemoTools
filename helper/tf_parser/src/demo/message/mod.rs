@@ -4,13 +4,13 @@ pub use crate::demo::message::bspdecal::*;
 pub use crate::demo::message::classinfo::*;
 pub use crate::demo::message::gameevent::*;
 pub use crate::demo::message::packetentities::*;
+pub use crate::demo::message::prefetch::*;
+pub use crate::demo::message::serverinfo::*;
 pub use crate::demo::message::setconvar::*;
 pub use crate::demo::message::stringtable::*;
 pub use crate::demo::message::tempentities::*;
 pub use crate::demo::message::usermessage::*;
 pub use crate::demo::message::voice::*;
-pub use crate::demo::message::prefetch::*;
-pub use crate::demo::message::serverinfo::*;
 use crate::demo::parser::{Encode, ParseBitSkip};
 use crate::{Parse, ParserState, Result, Stream};
 use bitbuffer::{BitRead, BitWrite, BitWriteStream, LittleEndian};
@@ -22,13 +22,13 @@ pub mod classinfo;
 pub mod gameevent;
 pub mod generated;
 pub mod packetentities;
+pub mod prefetch;
+mod serverinfo;
 pub mod setconvar;
 pub mod stringtable;
 pub mod tempentities;
 pub mod usermessage;
 pub mod voice;
-pub mod prefetch;
-mod serverinfo;
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema_repr))]
 #[derive(

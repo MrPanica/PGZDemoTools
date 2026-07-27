@@ -475,12 +475,12 @@ impl Analyser {
                         .push(ChatMessage::from_message(text_message, tick));
                 }
             }
-            UserMessage::Text(text_message) => {
-                if text_message.location == HudTextLocation::PrintTalk {
-                    self.state
-                        .chat
-                        .push(ChatMessage::from_text(text_message, tick));
-                }
+            UserMessage::Text(text_message)
+                if text_message.location == HudTextLocation::PrintTalk =>
+            {
+                self.state
+                    .chat
+                    .push(ChatMessage::from_text(text_message, tick));
             }
             _ => {}
         }
@@ -504,10 +504,8 @@ impl Analyser {
                     user_state.team = spawn.team;
                 }
             }
-            GameEvent::TeamPlayRoundWin(event) => {
-                if event.win_reason != WIN_REASON_TIME_LIMIT {
-                    self.state.rounds.push(Round::from_event(event, tick))
-                }
+            GameEvent::TeamPlayRoundWin(event) if event.win_reason != WIN_REASON_TIME_LIMIT => {
+                self.state.rounds.push(Round::from_event(event, tick))
             }
             _ => {}
         }

@@ -3,6 +3,7 @@ use crate::demo::packet::stringtable::{ExtraData, StringTableEntry};
 use crate::demo::parser::analyser::UserId;
 use crate::{ReadResult, Stream};
 use bitbuffer::{BitRead, BitReadBuffer, BitReadStream, BitWrite, BitWriteStream, LittleEndian};
+use encoding_rs::WINDOWS_1251;
 
 #[derive(BitRead, Debug)]
 struct RawPlayerInfo {
@@ -42,9 +43,7 @@ pub struct PlayerInfo {
 impl From<RawPlayerInfo> for PlayerInfo {
     fn from(raw: RawPlayerInfo) -> Self {
         PlayerInfo {
-            name: String::from_utf8_lossy(&raw.name_bytes)
-                .trim_end_matches('\0')
-                .to_string(),
+            name: decode_name(&raw.name_bytes),
             user_id: raw.user_id.into(),
             steam_id: raw.steam_id,
             extra: raw.extra,
@@ -57,6 +56,18 @@ impl From<RawPlayerInfo> for PlayerInfo {
             files_downloaded: raw.files_downloaded,
             more_extra: raw.more_extra,
         }
+    }
+}
+
+fn decode_name(bytes: &[u8]) -> String {
+    let bytes = bytes.split(|byte| *byte == 0).next().unwrap_or_default();
+    match std::str::from_utf8(bytes) {
+        Ok(name) => name.to_owned(),
+        Err(error) if error.error_len().is_none() => {
+            String::from_utf8_lossy(bytes.get(..error.valid_up_to()).unwrap_or_default())
+                .into_owned()
+        }
+        Err(_) => WINDOWS_1251.decode(bytes).0.replace('\u{fffd}', "?"),
     }
 }
 
@@ -105,5 +116,19 @@ impl UserInfo {
                 BitReadBuffer::new_owned(extra_data, LittleEndian),
             ))),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_name;
+
+    #[test]
+    fn decodes_legacy_and_truncated_names_without_replacement_characters() {
+        assert_eq!(
+            decode_name(&[0xcf, 0xf0, 0xe8, 0xe2, 0xe5, 0xf2, 0]),
+            "Привет"
+        );
+        assert_eq!(decode_name(&[b'A', 0xf0, 0x9d, 0x94]), "A");
     }
 }
